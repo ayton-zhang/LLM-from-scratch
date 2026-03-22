@@ -1,0 +1,45 @@
+{
+  "name": "LLM from Scratch",
+  "dockerComposeFile": "../docker-compose.yml",
+  "service": "llm-lab",
+  "workspaceFolder": "/app",
+  
+  // 1. 打通网络：让容器认得宿主机的 7897 端口
+  "runArgs": [
+    "--add-host=host.docker.internal:host-gateway"
+  ],
+
+  // 2. 强行镇压 VS Code 的错误环境变量，绑定到正确的网关
+  "containerEnv": {
+    "HTTP_PROXY": "http://host.docker.internal:7897",
+    "HTTPS_PROXY": "http://host.docker.internal:7897",
+    "http_proxy": "http://host.docker.internal:7897",
+    "https_proxy": "http://host.docker.internal:7897",
+    "NO_PROXY": "localhost,127.0.0.1"
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.debugpy",
+        "ms-python.vscode-pylance",
+        "github.copilot",
+        "github.copilot-chat"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "python.linting.enabled": true,
+        "python.linting.pylintEnabled": true,
+        "http.proxy": "http://host.docker.internal:7897",
+        "http.proxySupport": "override",
+        "http.proxyStrictSSL": false
+      }
+    }
+  },
+
+  // 3. 终结 pty.node 报错：构建完成后自动安装 C++ 底层运行库
+  "postCreateCommand": "apt-get update && apt-get install -y libx11-dev libxkbfile-dev libsecret-1-dev",
+
+  "remoteUser": "root"
+}

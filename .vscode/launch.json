@@ -1,19 +1,20 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
-
-
-
         {
-            "name": "Python Debugger: Current File",
+            // 这个配置允许你在 Docker 容器内调试当前打开的 Python 文件
+            "name": "Python: Docker 容器内调试 (当前文件)",
             "type": "debugpy",
             "request": "launch",
+            // ${file} 代表你当前正在编辑并选中的那个文件
             "program": "${file}",
+            // 使用集成终端输出调试信息
             "console": "integratedTerminal",
-            "args": ["--demo"]
+            // 设置为 true 时，调试器只会在你的代码里停下，不会进入 Python 标准库内部
+            "justMyCode": true
         }
     ]
 }

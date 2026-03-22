@@ -1,4 +1,9 @@
 __pycache__/
+*.py[cod]
 .pytest_cache/
 .DS_Store
 runs/
+*.pt
+*.bin
+*.safetensors
+.env
