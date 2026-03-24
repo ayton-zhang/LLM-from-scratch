@@ -65,9 +65,9 @@ def main():
     # 创建 GPT 模型并移到指定设备（GPU 或 CPU）
     model = GPT(tok.vocab_size, args.block_size, args.n_layer, args.n_head, args.n_embd, args.dropout).to(args.device)
 
-    # === 可选：模型编译优化（PyTorch 2.0+） ===
+    # === 可选：模型编译优化（PyTorch 2.0+），效果就是让模型训练更快 ===
     if args.compile and hasattr(torch, 'compile'):
-        model = torch.compile(model)  # 使用 torch.compile 加速，需要 PyTorch 2.0+
+        model = torch.compile(model)
 
     # === 优化器和梯度缩放器 ===
     # AdamW 优化器：带权重衰减的 Adam，betas 控制动量

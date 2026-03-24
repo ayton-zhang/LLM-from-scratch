@@ -6,4 +6,4 @@ runs/
 *.pt
 *.bin
 *.safetensors
-.env
+.venv

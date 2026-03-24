@@ -34,6 +34,15 @@ services:
     # 开启它之后，你在终端看到的输出会有颜色，且支持交互（比如输入 y/n）。
     tty: true
 
+    # deploy 配置将宿主机的所有 NVIDIA GPU 授权给容器使用
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
     # command 是“默认动作”。
     # 当你只输入 docker compose up 时，它就会自动运行这一行。
     # 我们默认运行第一章的形状演示脚本，作为环境检查。
