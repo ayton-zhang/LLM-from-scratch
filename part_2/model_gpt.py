@@ -1,31 +1,59 @@
 from __future__ import annotations
 import math
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn as nn          # nn 是 Neural Network (神经网络) 的缩写，包含了各种现成的网络层
+import torch.nn.functional as F # F 包含了一些不需要权重的纯数学函数运算（比如加减乘除的高级版）
 
-# ---- Blocks (self-contained for isolation) ----
-class CausalSelfAttention(nn.Module):
+# ==========================================
+# 组件一：自注意力机制 (模型的“雷达”)
+# ==========================================
+class CausalSelfAttention(nn.Module): # 继承 nn.Module，说明这是神经网络的一个零件
     def __init__(self, n_embd: int, n_head: int, dropout: float = 0.0):
-        super().__init__()
-        assert n_embd % n_head == 0
-        self.n_head = n_head
-        self.d_head = n_embd // n_head
+        super().__init__() # 拜见祖师爷，初始化父类
+        
+        # assert 确保总特征数(n_embd)能被多头数量(n_head)整除，不然没法平均分配
+        assert n_embd % n_head == 0 
+        
+        self.n_head = n_head # 头的数量 (相当于把雷达分成几个不同方向的探测器)
+        self.d_head = n_embd // n_head # 每个头分到的维度大小
+        
+        # 核心：Q(查询), K(钥匙), V(价值)。
+        # 这里用一个全连接层(Linear)把输入特征直接放大3倍，一次性把 Q, K, V 都算出来，比分开算更快。
         self.qkv = nn.Linear(n_embd, 3 * n_embd, bias=False)
+        # 算完之后，再用一个 Linear 把结果压缩回原来的维度
         self.proj = nn.Linear(n_embd, n_embd, bias=False)
+        # Dropout 是一种防止模型“死记硬背”(过拟合)的机制，它会随机把一些神经元打晕(设为0)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor):  # (B,T,C)
-        B, T, C = x.shape
+    def forward(self, x: torch.Tensor):  # forward 是 PyTorch 的核心，定义了数据怎么流过这个零件
+        # B = Batch Size (批次大小，也就是一次处理几道题)
+        # T = Time/Sequence Length (句子长度，比如一次处理 256 个字)
+        # C = Channels/Embedding Dim (每个字用多少个数字表示，即 n_embd)
+        B, T, C = x.shape 
+        
+        # .view() 相当于“变形金刚”。把算出来的 3*C 切分成 Q,K,V 三份，并分给不同的头(n_head)。
         qkv = self.qkv(x).view(B, T, 3, self.n_head, self.d_head)
+        
+        # .unbind(dim=2) 把刚才的 3 份沿着维度拆开，分别赋值给 q, k, v
         q, k, v = qkv.unbind(dim=2)
+        
+        # .transpose(1, 2) 是维度对调。为了让底层计算更快，要把 T(句子长度) 和 头数 换个位置。
+        # 现在的形状变成了 (B, n_head, T, d_head)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        scale = 1.0 / math.sqrt(self.d_head)
-        # PyTorch SDPA (uses flash when available)
+        
+        # 这是一个缩放因子（作者算出来了但其实没用上，因为下面的函数内部自带了缩放功能）
+        scale = 1.0 / math.sqrt(self.d_head) 
+        
+        # 魔法函数！这是 PyTorch 官方提供的超级加速版注意力计算公式（FlashAttention）。
+        # is_causal=True 最关键：它蒙住模型的眼睛，让模型只能看到前面的字，绝对不能偷看后面的答案！
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout.p if self.training else 0.0, is_causal=True)
+        
+        # 算完之后，把刚才对调的维度再换回来。.contiguous() 是在内存里把数据排列整齐，方便再用 .view() 变回 (B, T, C)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
+        
+        # 最后经过一个线性层输出
         y = self.proj(y)
         return y
 

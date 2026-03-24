@@ -38,8 +38,17 @@
     }
   },
 
-  // 3. 终结 pty.node 报错：构建完成后自动安装 C++ 底层运行库
-  "postCreateCommand": "apt-get update && apt-get install -y libx11-dev libxkbfile-dev libsecret-1-dev",
+ // 1. 【新增】：让容器自动创建一个名叫 vscode 的“普通账号”，并赋予它免密码的 sudo 权限
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "username": "ayton",
+      "upgradePackages": false
+    }
+  },
 
-  "remoteUser": "root"
+  // 2. 【修改】：因为你现在是普通用户了，所以前面的 apt-get 必须加上 sudo
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y libx11-dev libxkbfile-dev libsecret-1-dev",
+
+  // 3. 【最核心的修复】：剥夺 root 身份，以普通用户登录，Claude 就不会报错了！
+  "remoteUser": "ayton"
 }
