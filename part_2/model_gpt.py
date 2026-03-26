@@ -165,37 +165,63 @@ class GPT(nn.Module):
     # ==========================================
     # 推理生成函数
     # ==========================================
-    @torch.no_grad() # 魔法指令：告诉系统“我现在是实战考试，不是在学习(训练)”。这会省下巨量内存，因为不需要记住解题思路(梯度)了。
+
+    # @torch.no_grad() 是装饰器语法，写在函数定义上方，进入该函数后
+    # PyTorch 不再追踪计算图（不记录梯度）。
+    # 推理时不需要反向传播，关掉梯度追踪可显著节省显存并提升速度。
+    @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int = 200, temperature: float = 1.0, top_k: int | None = 50, top_p: float | None = None):
+        # 参数说明：
+        #   idx            : 输入 token 序列，形状 (B, T)，B=批次大小，T=当前序列长度
+        #   max_new_tokens : 最多再生成多少个新 token
+        #   temperature    : 控制随机性，< 1 输出更确定，> 1 输出更随机
+        #   top_k          : 只从概率最高的 k 个候选 token 中采样
+        #   top_p          : 只从累计概率达到 p 的最小候选集中采样（nucleus sampling）
         from utils import top_k_top_p_filtering
+
+        # self.eval() 将模型切换到推理模式。
+        # 对本模型的实际影响：Dropout 层关闭，不再随机丢弃神经元，输出变为确定性的。
         self.eval()
-        
-        # 如果你没给模型提示词，它就自己放一个换行符(编号10)作为起点
+
+        # idx.size(1) 获取张量第 1 维（序列长度 T）的大小。
+        # T == 0 表示没有任何提示词，自动填入换行符（token id=10）作为起始 token。
+        # torch.full((B, 1), 10, ...) 创建形状 (B, 1)、所有值为 10 的张量。
         if idx.size(1) == 0:
             idx = torch.full((idx.size(0), 1), 10, dtype=torch.long, device=idx.device)
-            
-        # 循环：打算让模型写多少个新词，就循环多少次
+
+        # 主循环：每轮生成 1 个新 token，共循环 max_new_tokens 次。
         for _ in range(max_new_tokens):
-            # 如果句子太长了，只截取最后 block_size 个字给模型看（因为它的脑容量只有这么大）
+            # 截断：模型有最大上下文长度限制（block_size）。
+            # idx[:, -self.block_size:] 取所有 batch（:）的最后 block_size 个 token，
+            # 超出的历史 token 直接丢弃。
             idx_cond = idx[:, -self.block_size:]
-            
-            # 把这段文字扔进模型，拿到原始打分 logits
+
+            # 返回 logits 形状 (B, T, vocab_size)，以及 loss（推理时为 None，用 _ 忽略）。
             logits, _ = self(idx_cond)
-            
-            # 我们只要最后一个字(刚才新生成的字)的预测分数。/ temperature 是控制发散程度。
-            # temperature 越小（比如 0.1），模型越死板保守；越大（比如 1.5），模型越放飞自我瞎编。
+
+            # logits[:, -1, :] 只取序列最后一个位置的预测，形状变为 (B, vocab_size)。
+            # 因为我们只需要预测"下一个 token"，中间位置的预测用不到。
+            # 除以 temperature，
+            # softmax运算会用到e：值 < 1 让分布更"尖"（高分更突出，输出更保守），
+            #                    值 > 1 让分布更"平"（各词差距缩小，输出更随机）。
+            # max(..., 1e-6) 防止 temperature=0 时发生除以零错误。
             logits = logits[:, -1, :] / max(temperature, 1e-6)
-            
-            # 过滤掉那些得分极低的“胡言乱语”，只留得分最高的 K 个候选人
+
+            # top-k / top-p 过滤：将低分 token 的 logits 设为 -inf，
+            # 经 softmax 后这些 token 概率变为 0，不会被采样到。
             logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
-            
-            # 把原始得分转换成加起来等于 100% 的概率 (Softmax)
+
+            # softmax 将任意实数的 logits 转换为概率分布（0~1 之间，总和为 1）。
+            # dim=-1 表示在最后一维（vocab_size）上做归一化。
             probs = torch.softmax(logits, dim=-1)
-            
-            # multinomial：按概率摇号抽奖！得分高的词抽中的概率大，但不绝对。抽出 1 个新词。
+
+            # torch.multinomial 按概率分布随机抽样，num_samples=1 每次抽 1 个 token。
+            # 概率高的 token 被抽到的可能性更大，但不是绝对。返回形状 (B, 1)。
             next_id = torch.multinomial(probs, num_samples=1)
-            
-            # 把新抽出来的一个词，拼接到原来的句子里。进入下一次循环！
+
+            # torch.cat 在 dim=1（序列长度维度）上拼接，把新生成的 token 追加到末尾。
+            # idx 形状从 (B, T) 变为 (B, T+1)，进入下一轮循环继续生成。
             idx = torch.cat([idx, next_id], dim=1)
-            
-        return idx # 循环结束，返回写好的大长篇
+
+        # 返回完整序列，形状 (B, T + max_new_tokens)，包含原始输入和所有新生成的 token。
+        return idx
