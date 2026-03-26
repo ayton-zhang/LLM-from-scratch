@@ -89,14 +89,15 @@ def main():
             _, loss = model(xb, yb)  # 前向传播，获得损失（忽略预测值）
         # === 反向传播和优化 ===
         opt.zero_grad(set_to_none=True)  # 清空上一步的梯度（set_to_none=True 比赋值 0 更高效）
-        scaler.scale(loss).backward()  # 缩放损失后反向传播，计算梯度
+        scaler.scale(loss).backward()  # 将loss乘以一个放大因子，之后做反向传播
         # === 梯度裁剪（防止梯度爆炸） ===
         if args.grad_clip > 0:  # 如果设置了梯度裁剪
-            scaler.unscale_(opt)  # 恢复梯度的原始大小（取消缩放）
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)  # 裁剪梯度范数，保证 ≤ grad_clip
+            scaler.unscale_(opt)  # 除以放大因子，恢复原始梯度值
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)  
+            # 裁剪梯度范数，保证 ≤ grad_clip，防止梯度爆炸
         # === 更新参数 ===
         scaler.step(opt)  # 优化器步进（自动处理缩放）
-        scaler.update()  # 更新缩放器的缩放因子
+        scaler.update()  # 根据本步是否出现inf/nan来动态调整放大因子
 
         # === 定期日志输出（每 50 步） ===
         if step % 50 == 0:
@@ -121,7 +122,7 @@ def main():
                     'n_head': args.n_head,  # 多头注意力的头数
                     'n_embd': args.n_embd,  # 嵌入维度
                     'dropout': args.dropout,  # dropout 比率
-                }}, ckpt_path)  # 保存到文件
+                }}, ckpt_path)  # torch.save(obj, path) 将 obj 保存到 path 文件中
                 print(f"saved checkpoint: {ckpt_path}")
 
         # === 定期采样并生成文本 ===
