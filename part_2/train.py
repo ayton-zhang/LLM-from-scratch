@@ -6,6 +6,24 @@ from dataset import ByteDataset  # 数据集加载器
 from model_gpt import GPT  # GPT 模型类
 
 
+def _state_dict_for_saving(model: torch.nn.Module) -> dict:
+    """返回可跨脚本直接加载的 state_dict（兼容 torch.compile）。"""
+    # 先取出当前模型参数字典；键名通常是 "tok_emb.weight" 这类形式。
+    raw_state_dict = model.state_dict()
+
+    # all(...) + 生成器表达式语法：
+    # all(条件 for 元素 in 可迭代对象) 表示“所有元素都满足条件才为 True”。
+    # 如果全部键都以 "_orig_mod." 开头，说明是 compile 包装后的命名格式。
+    if raw_state_dict and all(k.startswith('_orig_mod.') for k in raw_state_dict.keys()):
+        # 字典推导式语法：{新键: 原值 for 旧键, 原值 in 原字典.items()}
+        # 字符串切片 k[len('_orig_mod.'):]：从前缀长度位置开始截取，达到“去前缀”效果。
+        # 例如 "_orig_mod.head.weight" -> "head.weight"。
+        return {k[len('_orig_mod.'):]: v for k, v in raw_state_dict.items()}
+
+    # 非 compile 场景直接返回原字典，保证行为与原来一致。
+    return raw_state_dict
+
+
 def estimate_loss(model: GPT, ds: ByteDataset, args) -> dict:
     """评估模型在训练集和验证集上的平均损失。"""
     model.eval()  # 设置模型为评估模式（关闭 dropout 等）
@@ -114,8 +132,10 @@ def main():
                 best_val = losses['val']  # 更新最好的验证损失
                 ckpt_path = f"{args.out_dir}/model_best.pt"  # 构造检查点路径
                 import os; os.makedirs(args.out_dir, exist_ok=True)  # 创建输出目录
+                # 保存时统一规范化键名，避免后续 eval/sample 再处理前缀兼容。
+                save_state_dict = _state_dict_for_saving(model)
                 # 保存模型权重和配置信息到文件
-                torch.save({'model': model.state_dict(), 'config': {
+                torch.save({'model': save_state_dict, 'config': {
                     'vocab_size': tok.vocab_size,  # 词汇表大小
                     'block_size': args.block_size,  # 上下文长度
                     'n_layer': args.n_layer,  # Transformer 层数
@@ -141,7 +161,8 @@ def main():
     # === 最终保存 ===
     # 训练完成后，保存最终模型（仅包含权重，不含配置）
     import os; os.makedirs(args.out_dir, exist_ok=True)
-    torch.save({'model': model.state_dict()}, f"{args.out_dir}/model_final.pt")
+    # 最终模型同样做键名规范化，保证任意脚本加载格式一致。
+    torch.save({'model': _state_dict_for_saving(model)}, f"{args.out_dir}/model_final.pt")
 
 
 # === 程序入口点 ===
