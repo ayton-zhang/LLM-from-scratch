@@ -31,7 +31,7 @@ git push origin main
 ## 语法用法
 
 ### `git checkout -b <branch-name>`
-- `-b` 是 `--create-branch` 的缩写，表示"创建并立即切换"到新分支。
+- `-b` 表示“创建一个新分支并立即切换到该分支”。
 - 等价于先运行 `git branch`（创建指针）再运行 `git checkout`（移动 HEAD）。
 - 新版 Git（2.23+）推荐使用 `git switch -c <branch-name>` 替代。
 
