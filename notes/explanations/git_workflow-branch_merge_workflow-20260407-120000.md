@@ -126,6 +126,39 @@ Git 找到公共祖先 C，对比 C→F 和 C→D 的差异，自动合并。若
 
 ---
 
+## 约定俗成规范（分支命名与 PR 流程）
+
+### 为什么 push 分支后会看到 Pull Request 提示
+- 你执行 `git push origin test-code` 后，远程仓库会发现这是一个相对 `main` 有差异的新分支。
+- GitHub 会据此给出“Compare & pull request”提示，目的是引导你进入团队协作流程，而不是自动合并。
+- 这个提示来自托管平台工作流（GitHub/GitLab），不是 Git 本体命令的一部分。
+
+### Pull Request 的协作价值
+- **代码评审（Code Review）**：让他人在合并前检查逻辑、风格、边界条件。
+- **自动检查（CI）**：在合并前跑测试、lint、静态检查、CodeRabbit 评论。
+- **讨论与审计记录**：PR 会保存“改了什么、为什么改、谁审批”的完整记录。
+- **受保护分支策略**：很多团队禁止直接 push 到 `main`，必须通过 PR 合并。
+
+### `feature/` 前缀为什么常见
+- `feature/` 不是 Git 语法强制要求，而是团队命名约定（convention）。
+- 主要价值是“可读性和可管理性”：一眼区分这是新功能分支，而不是修复或运维分支。
+- 也方便 CI/CD 按前缀匹配规则，例如只对 `feature/*` 触发某些检查。
+
+### 常见分支前缀建议
+- `feature/<name>`：新功能开发
+- `fix/<name>`：普通缺陷修复
+- `hotfix/<name>`：线上紧急修复
+- `chore/<name>`：工程杂务（依赖升级、脚本、重构清理）
+- `docs/<name>`：文档更新
+- `test/<name>`：测试相关改动
+
+### 实操建议
+- 个人实验可以用简单名（如 `test-code`），团队协作建议使用前缀（如 `feature/code-rabbit-review-test`）。
+- 分支名尽量短且语义清晰，统一用小写加连字符。
+- 合并前先同步主分支（`git pull origin main`），可提前发现冲突并在本地解决。
+
+---
+
 ## 关键知识点总结
 
 1. **Branch 是轻量级指针**：Git 中的分支本质上只是一个指向某个 commit 的文件（`.git/refs/heads/<name>`），创建分支几乎零成本，不会复制任何代码。
