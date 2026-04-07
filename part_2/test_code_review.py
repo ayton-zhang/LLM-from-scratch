@@ -39,7 +39,9 @@ def load_checkpoint(path):
 
 
 if __name__ == "__main__":
+    embedding = nn.Embedding(VOCAB_SIZE, EMBED_DIM)
     model = TransformerBlock(EMBED_DIM, N_HEADS, FF_DIM)
-    x = torch.randn(2, 16, EMBED_DIM)
+    token_ids = torch.randint(0, VOCAB_SIZE, (2, 16))
+    x = embedding(token_ids)
     out = model(x)
     print(f"Output shape: {out.shape}")
