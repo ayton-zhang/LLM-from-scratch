@@ -33,8 +33,8 @@ def load_checkpoint(path):
     try:
         checkpoint = torch.load(path, map_location="cpu")
         return checkpoint
-    except:
-        print("Failed to load checkpoint")
+    except Exception as e:
+        print(f"Failed to load checkpoint from {path}: {e}")
         return None
 
 
