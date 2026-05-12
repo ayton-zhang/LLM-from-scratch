@@ -9,7 +9,7 @@ import torch.nn.functional as F
 # ==========================================
 class CausalSelfAttention(nn.Module): # 继承 nn.Module，说明这是神经网络的一个零件
     def __init__(self, n_embd: int, n_head: int, dropout: float = 0.0):
-        super().__init__() # 拜见祖师爷，初始化父类
+        super().__init__() 
         
         # assert 确保总特征数(n_embd)能被多头数量(n_head)整除，不然没法平均分配
         assert n_embd % n_head == 0 
