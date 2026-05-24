@@ -9,12 +9,12 @@ from tokenizer import ByteTokenizer
 # ==========================================
 # os.path.dirname(__file__) 获取本文件 (model_modern.py) 所在的目录，即 part_3/
 # os.path.join(..., '..') 向上走一级，指向项目根目录 llm_from_scratch/
-# sys.path.insert(0, ...) 把根目录插入模块搜索路径的最前面，
+# os.path.abspath(...) 把路径转换为绝对路径，确保无论从哪里运行脚本都能正确找到模块。
+# sys.path.insert(0, ...) 把根目录插入模块搜索路径的最前面，这样 Python 在导入模块时会优先在根目录下查找，
 # 这样 part_4、part_6 等目录中的脚本 `from part_3.model_modern import GPTModern` 才能找到这个文件。
 import os, sys
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, parent_dir)
-
 
 # ==========================================
 # 完整的现代 GPT 模型（Part 3 及后续 Part 4-9 的核心骨架）
@@ -206,15 +206,17 @@ class GPTModern(nn.Module):
         kvs = [None] * len(self.blocks)
 
         for _ in range(max_new_tokens):
-            # ─── 关键优化：KV Cache 的核心逻辑 ───
+            # ─── KV Cache 的核心逻辑 ───
             # 第一步（kvs[0] is None）：缓存为空，需要把整个 prompt 喂进去，让模型"读懂"上下文。
             # 后续步骤（kvs[0] 已填充）：历史 K/V 已缓存，只需把最新生成的 1 个 token 喂进去，
             # 计算量从 O(T²) 降至 O(T)，推理速度大幅提升。
             idx_cond = idx[:, -self.block_size:] if kvs[0] is None else idx[:, -1:]
 
             # start_pos 告诉 RoPE 当前这批 token 在完整序列中的起始位置：
-            # 第一步为 0（从头开始）；后续步骤从缓存的 K 的序列长度维读出已处理的 token 数。
-            # kvs[0].k.size(2) 取第 0 层缓存的 K 张量的时间维度（dim=2），即已缓存 token 数。
+            # 第一步为 0（从头开始）；
+            # 后续步骤从缓存的 K 的序列长度维读出已处理的 token 数：
+            #   kvs[0].k.size(2) → 取第 0 层缓存的 K 张量的时间维度（dim=2），即已缓存 token 数。
+            # 语法：`A if 条件 else B` 三元表达式，kvs[0] is None 为 True 时取 0，否则取缓存长度。
             start_pos = 0 if kvs[0] is None else kvs[0].k.size(2)
 
             # 前向传播，同时传入并更新 KV Cache（kvs 变量在每步被覆盖为最新的缓存）
