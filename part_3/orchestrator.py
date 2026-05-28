@@ -68,7 +68,8 @@ if __name__ == "__main__":
     #
     # python -m pytest tests/ 一次性跑全部，-v 显示每个测试名。
     # 用户可在感兴趣的函数中设断点，通过 debug 跟踪具体组件的计算流程。
-    run("python -m pytest -q tests/")
+    run(f"{sys.executable} -m pytest -q tests/test_training_flow.py")
+    run(f"{sys.executable} -m pytest -q tests/test_generate_flow.py")
 
     # ─── 阶段 2：生成演示（可选）───
     # 只在用户指定 --demo 时才执行。
@@ -76,7 +77,7 @@ if __name__ == "__main__":
     # 又不会太耗时（几秒内完成，适合快速验证改动）。
     # 对比：训练用的完整脚本可能跑几千 token 或直至 EOS，这里只需要"看一眼效果"。
     if args.demo:
-        run("python demo_generate.py --rmsnorm --rope --swiglu --sliding_window 64 --sink 4 --tokens 200")
+        run(f"{sys.executable} demo_generate.py --rmsnorm --rope --swiglu --sliding_window 64 --sink 4 --tokens 200")
 
     # ─── 完成提示 ───
     # 如果任何一步失败，sys.exit() 会在此之前终止脚本，所以能打印到这里 = 全部通过。

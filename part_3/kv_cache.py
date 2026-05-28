@@ -53,8 +53,21 @@ class RollingKV:
         # 初始状态缓冲区为空，第一次 step 时懒初始化。
         self.k = None
         self.v = None
+        # 累计处理的 token 总数（含已被裁剪丢弃的），用于 RoPE 位置计算。
+        # 缓存长度 k.size(2) 被裁剪后可能小于实际历史 token 数，
+        # 但 start_pos 必须基于"总历史 token 数"而非"缓存长度"。
+        self.total_tokens = 0
+
+    @property
+    def T(self):
+        # 返回已处理的总 token 数（非当前缓存的 token 数），
+        # 与 KVCache.T 语义一致：当缓存不被裁剪时，两者相等；
+        # 当滑动窗口裁剪后，T 仍返回历史总长，供 RoPE start_pos 计算使用。
+        return self.total_tokens
 
     def step(self, k_new: torch.Tensor, v_new: torch.Tensor):
+        # 累计已处理的总 token 数：新 token 有 k_new.size(2) 个。
+        self.total_tokens += k_new.size(2)
         # 第一步：把新 token 的 K/V 追加到缓冲区末尾。
         if self.k is None:
             # 缓冲区为空（第一次调用），直接用新 K/V 初始化。

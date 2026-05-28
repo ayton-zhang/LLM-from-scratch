@@ -41,9 +41,8 @@ class TransformerBlockModern(nn.Module):
         self.ln2 = Norm(n_embd)
 
         # 前馈网络（FFN）：
-        # use_swiglu=True 时使用 SwiGLU 门控 FFN（Swish 激活 × 线性门），
-        # 表达能力更强，是 LLaMA / PaLM 等现代模型的标配。
-        # 否则退回到经典的 Linear → GELU → Linear 结构（与 Part 2 兼容）。
+        # use_swiglu=True 时使用 SwiGLU 门控 FFN（Swish 激活 × 线性门）
+        # 否则退回到经典的 Linear → GELU → Linear 结构（与 Part 2 兼容）
         self.ffn = SwiGLU(n_embd, mult=4, dropout=dropout) if use_swiglu else nn.Sequential(
             nn.Linear(n_embd, 4*n_embd), nn.GELU(), nn.Linear(4*n_embd, n_embd), nn.Dropout(dropout)
         )

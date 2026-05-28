@@ -11,7 +11,7 @@ import math, torch
 import torch.nn as nn
 import torch.nn.functional as F
 from rope_custom import RoPECache, apply_rope_single
-from kv_cache import KVCache  # your existing class
+from kv_cache import KVCache, RollingKV  # 简单缓存 + 滚动缓冲区（支持滑动窗口+sink）
 
 class CausalSelfAttentionModern(nn.Module):
     def __init__(self, n_embd: int, n_head: int, dropout: float = 0.0,
@@ -100,24 +100,60 @@ class CausalSelfAttentionModern(nn.Module):
             k = apply_rope_single(k, cos, sin)  # (B, Hk, T, D)
 
         # ─── KV Cache：拼接历史缓存 ───
-        # 推理时 kv_cache 已存有之前所有 token 的 K/V，
-        # 语法：torch.cat([a, b], dim=2) 在时间维（dim=2）拼接，追加新 token 的 K/V。
-        # k_all 形状：(B, Hk, Tpast+T, D)，包含完整历史。
+        # 两种缓存类型：
+        #   RollingKV（sliding_window 不为 None 时）：step() 自动拼接 + 裁剪到 sink+window，
+        #       返回的 k_all/v_all 已经是被裁剪后的局部 K/V，显存固定不增长。
+        #   KVCache（sliding_window 为 None 时）：简单拼接，不做裁剪，适用于全局注意力。
         if kv_cache is not None:
-            k_all = torch.cat([kv_cache.k, k], dim=2)  # (B, Hk, Tpast+T, D)
-            v_all = torch.cat([kv_cache.v, v], dim=2)
+            if isinstance(kv_cache, RollingKV):
+                # RollingKV.step() 内部自动完成：拼接新 K/V → 裁剪到 sink+window → 返回裁剪后的值
+                k_all, v_all = kv_cache.step(k, v)  # (B, Hk, ≤sink+window, D)
+            else:
+                # KVCache：手动在时间维拼接新旧 K/V，不裁剪
+                k_all = torch.cat([kv_cache.k, k], dim=2)  # (B, Hk, Tpast+T, D)
+                v_all = torch.cat([kv_cache.v, v], dim=2)
         else:
             k_all, v_all = k, v
 
         # ─── 滑动窗口 + 注意力水槽裁剪 ───
-        # 当历史长度超过 (sliding_window + attention_sink) 时，裁剪 K/V，只保留：
-        #   前 attention_sink 个 token（锚点，永不丢弃）
-        # + 最近 sliding_window 个 token（滑动窗口）
-        # 语法：torch.cat([..., ...], dim=2) 把两段重新拼成完整的局部上下文。
-        if self.sliding_window is not None and k_all.size(2) > (self.sliding_window + self.attention_sink):
-            s = self.attention_sink
-            k_all = torch.cat([k_all[:, :, :s, :], k_all[:, :, -self.sliding_window:, :]], dim=2)
-            v_all = torch.cat([v_all[:, :, :s, :], v_all[:, :, -self.sliding_window:, :]], dim=2)
+        # 三种情况分别处理：
+        #   1. RollingKV 已维护窗口 → 无需额外裁剪或 mask（缓存已限长）
+        #   2. KVCache + sliding_window → 手动裁剪 k_all/v_all（历史总是受限，但缓存未限）
+        #   3. 无缓存 + sliding_window → 构造自定义 mask（因果 + 滑窗），不直接裁剪张量
+        attn_mask = None
+        is_causal = (kv_cache is None) and (self.sliding_window is None)
+
+        if self.sliding_window is not None:
+            if isinstance(kv_cache, RollingKV):
+                # RollingKV 已自动维护 sink+window，缓存值即最终窗口值，无需额外处理
+                pass
+            elif kv_cache is not None:
+                # KVCache + sliding_window：手动裁剪 K/V，只保留前 sink 个 + 后 window 个
+                limit = self.sliding_window + self.attention_sink
+                if k_all.size(2) > limit:
+                    s = self.attention_sink
+                    # 语法：[:, :, -self.sliding_window:, :] 负索引取时间维最后 sliding_window 个
+                    k_all = torch.cat([k_all[:, :, :s, :], k_all[:, :, -self.sliding_window:, :]], dim=2)
+                    v_all = torch.cat([v_all[:, :, :s, :], v_all[:, :, -self.sliding_window:, :]], dim=2)
+            else:
+                # ─── 无缓存路径 + 滑动窗口：构造自定义注意力 mask ───
+                # 与旧代码"直接裁剪 K/V 再用 is_causal=True"的方式不同，这里不裁剪 K/V，
+                # 而是构造一张同时包含因果约束和滑窗约束的 mask，避免裁剪导致的索引错位。
+                # mask[i, j] = -inf 当 (j > i) 或 (j < i - sliding_window + 1 且 j >= attention_sink)
+                T_q = q.size(2)
+                T_k = k_all.size(2)
+                # 语法：torch.arange(N) 生成 [0,1,...,N-1]，unsqueeze 扩张维度用于广播比较
+                row = torch.arange(T_q, device=q.device).unsqueeze(1)  # (T_q, 1)
+                col = torch.arange(T_k, device=q.device).unsqueeze(0)  # (1, T_k)
+                # 因果约束：j > i → 遮蔽
+                causal_mask = col > row
+                # 滑窗约束：j < i - W + 1 且 j 不是 sink 锚点 → 遮蔽
+                # attention_sink 个开头的锚点 token 对任意 i 都始终可见（永不滑出窗口）
+                outside_window = (col < row - self.sliding_window + 1) & (col >= self.attention_sink)
+                # 语法：torch.where(条件, A, B) 条件为 True 取 A（-inf 遮蔽），否则取 B（0 可见）
+                attn_mask = torch.where(causal_mask | outside_window, float('-inf'), 0.0)
+                # SDPA 要求 mask 形状 (B, 1, T_q, T_k) 或可广播到该形状
+                attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, T_q, T_k)
 
         # ─── GQA 扩展：把 Hk 个 K/V 头复制成 H 个，与 Q 头数对齐 ───
         # 语法：.repeat_interleave(group_size, dim=1) 沿头维度（dim=1）将每个 K/V 头
@@ -134,11 +170,11 @@ class CausalSelfAttentionModern(nn.Module):
         # F.scaled_dot_product_attention 是 PyTorch 2.0+ 的融合算子，
         # 内部自动完成 scale（除以 √d_head）、softmax、dropout、与 V 的加权求和，
         # 比手写拆开算更快（支持 Flash Attention 等底层优化）。
-        # is_causal=True：训练时开启因果掩码（下三角注意力），防止未来 token 信息泄露；
-        # is_causal=False：推理时 kv_cache 已存在，当前只有 1 个新 token，无需因果掩码。
-        is_causal = kv_cache is None
+        # is_causal：无滑动窗口 + 无缓存时开启因果掩码；有滑动窗口时走自定义 mask。
+        # 注意：is_causal=True 与 attn_mask 不能同时传入（PyTorch 会报错），
+        #       这里的逻辑保证了它们互斥。
         y = F.scaled_dot_product_attention(q, k_attn, v_attn,
-                                           attn_mask=None,
+                                           attn_mask=attn_mask,
                                            dropout_p=self.dropout.p if self.training else 0.0,
                                            is_causal=is_causal)  # (B, H, T, D)
 
@@ -151,14 +187,25 @@ class CausalSelfAttentionModern(nn.Module):
         y = self.proj(y)
 
         # ─── 更新 KV Cache（存储紧凑的 Hk 头，而非扩展后的 H 头）───
-        # 注意：缓存存的是旋转后的 K（已含位置信息），下次直接拼接即可，无需再旋转。
-        # 语法：torch.cat([kv_cache.k, k], dim=2) 把旧缓存和新 K 在时间维拼接，
-        #       k 是本次新 token 对应的 K（未经 GQA 扩展的紧凑版）。
+        # 缓存存的是旋转后的 K（已含位置信息），下次直接读取即可，无需再旋转。
+        # 根据是否开启滑动窗口选择不同的缓存容器：
+        #   RollingKV：滑动窗口模式下，step() 自动维护 sink+window 裁剪，显存固定
+        #   KVCache：全局注意力模式，简单拼接不裁剪，适用于短序列推理
         if kv_cache is not None:
-            k_new = torch.cat([kv_cache.k, k], dim=2)  # (B, Hk, *, D)
-            v_new = torch.cat([kv_cache.v, v], dim=2)
+            if isinstance(kv_cache, RollingKV):
+                # RollingKV 已在 step() 中原地更新，直接返回自身即可
+                new_cache = kv_cache
+            else:
+                # KVCache：手动拼接新旧 K/V，包装为新缓存对象
+                k_new = torch.cat([kv_cache.k, k], dim=2)  # (B, Hk, *, D)
+                v_new = torch.cat([kv_cache.v, v], dim=2)
+                new_cache = KVCache(k_new, v_new)
         else:
-            k_new, v_new = k, v
-        # 把新的 K/V 包装成 KVCache 对象返回，供下一个生成步骤使用。
-        new_cache = KVCache(k_new, v_new)
+            if self.sliding_window is not None:
+                # 首次调用 + 滑动窗口开启：创建 RollingKV 并用当前 K/V 初始化
+                new_cache = RollingKV(window=self.sliding_window, sink=self.attention_sink)
+                new_cache.step(k, v)
+            else:
+                # 首次调用 + 全局注意力：用 KVCache 包装当前 K/V
+                new_cache = KVCache(k, v)
         return y, new_cache

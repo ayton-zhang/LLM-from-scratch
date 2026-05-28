@@ -29,7 +29,8 @@ def test_full_model_training_forward_backward():
         use_rmsnorm=True,   # ← 用 RMSNorm 替代 LayerNorm
         use_swiglu=True,    # ← 用 SwiGLU 替代 GELU FFN
         rope=True,          # ← 用 RoPE 替代学习型位置嵌入
-        max_pos=128,
+        max_pos=128,    # RoPE 预计算的最大序列长度
+        sliding_window=4,   # ← 开启滑动窗口注意力，每个 token 只关注最近 4 个位置
     )
     model.train()  # 设为训练模式（开启 Dropout 的逻辑，但因 dropout=0 实际无影响）
 

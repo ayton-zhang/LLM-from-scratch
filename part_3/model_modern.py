@@ -118,15 +118,7 @@ class GPTModern(nn.Module):
         B, T = idx.shape
         assert T <= self.block_size  # 防止输入超过模型设计的最大上下文长度
 
-        # torch.arange(0, T, device=idx.device) 生成 [0, 1, ..., T-1] 的一维张量。
-        # device=idx.device 确保这个张量和输入在同一设备（CPU 或 GPU），避免跨设备运算报错。
-        # .unsqueeze(0) 在最前面插入一个维度：形状从 (T,) 变为 (1, T)，
-        # 这样广播机制才能让它与形状 (B, T) 的 idx 对齐。
-        # 注意：这里的 pos 仅作为占位符，实际位置编码由 RoPE 在注意力层内部处理，
-        # 不再像 Part 2 那样直接加到 tok_emb 上。
-        pos = torch.arange(0, T, device=idx.device).unsqueeze(0)
-
-        # 只做词嵌入，不加位置嵌入（RoPE 已接管位置编码）
+        # 只做词嵌入，不加位置嵌入（RoPE 已接管位置编码，不再像 Part 2 那样加 pos_emb）
         x = self.tok_emb(idx)
         # x = x + self.pos_emb(pos)   ← Part 2 的做法，这里已弃用
         x = self.drop(x)
@@ -214,10 +206,11 @@ class GPTModern(nn.Module):
 
             # start_pos 告诉 RoPE 当前这批 token 在完整序列中的起始位置：
             # 第一步为 0（从头开始）；
-            # 后续步骤从缓存的 K 的序列长度维读出已处理的 token 数：
-            #   kvs[0].k.size(2) → 取第 0 层缓存的 K 张量的时间维度（dim=2），即已缓存 token 数。
-            # 语法：`A if 条件 else B` 三元表达式，kvs[0] is None 为 True 时取 0，否则取缓存长度。
-            start_pos = 0 if kvs[0] is None else kvs[0].k.size(2)
+            # 后续步骤从缓存的 T 属性读出已处理的总 token 数。
+            # 语法：`A if 条件 else B` 三元表达式，kvs[0] is None 为 True 时取 0，否则取已处理 token 总数。
+            # 注意：这里用 .T 而非 .k.size(2)，因为 RollingKV 启用滑动窗口后缓存会被裁剪，
+            #       k.size(2) 会 ≤ sink+window，但 T 始终等于历史 token 总数，正确反映位置偏移。
+            start_pos = 0 if kvs[0] is None else kvs[0].T
 
             # 前向传播，同时传入并更新 KV Cache（kvs 变量在每步被覆盖为最新的缓存）
             # 语法：`logits, _, kvs = self(...)` 是多返回值解包。
@@ -272,7 +265,7 @@ class GPTModern(nn.Module):
     # ==========================================
     @torch.no_grad()
     def generate_nocache(self, prompt: torch.Tensor, max_new_tokens=200, temperature=1.0, top_k=50, top_p=None,
-                sliding_window: int | None = None, attention_sink: int = 0):
+                sliding_window: int | None = None, attention_sink: int = 0, eos_id: int | None = 1):
         # 本函数与 generate() 功能相同，但故意不使用 KV Cache。
         # 用途：
         #   1. 验证 KV Cache 实现是否正确（两者输出应完全一致）
@@ -315,6 +308,10 @@ class GPTModern(nn.Module):
 
             next_id = torch.argmax(probs, dim=-1, keepdim=True) if temperature == 0.0 else torch.multinomial(probs, 1)
             idx = torch.cat([idx, next_id], dim=1)
+
+            # 与 generate() 一致：遇到 EOS 提前终止
+            if eos_id is not None and (next_id == eos_id).all():
+                break
 
         return idx
 

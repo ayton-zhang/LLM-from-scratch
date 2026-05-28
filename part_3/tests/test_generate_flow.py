@@ -112,3 +112,34 @@ def test_generate_prefill_and_decode_cache_state():
     # prefill 阶段的旧缓存值没被覆盖（前 5 个 token 的 K 值应与之前完全一致）
     assert torch.equal(kvs[0].k[:, :, :T_prompt, :], prefill_k_layer0), \
         "Prefill K values should be preserved after decode step"
+
+
+def test_generate_cache_vs_nocache_with_sliding_window():
+    """开启滑动窗口后，KV Cache 版与无缓存版输出应完全一致。
+
+    滑动窗口改变了注意力计算逻辑：每个 token 只关注最近 W 个位置。
+    KV Cache 路径使用 RollingKV 维护裁剪后的缓存，无缓存路径使用自定义 mask
+    （因果 + 滑动窗口组合约束）。温度 0 贪心解码下两者输出应逐 token 一致。
+
+    这是验证 sliding_window + RollingKV + 自定义 mask 协同正确性的关键测试。
+    """
+    model = GPTModern(
+        vocab_size=256, block_size=64, n_layer=2, n_head=4, n_embd=64,
+        dropout=0.0, use_rmsnorm=True, use_swiglu=True, rope=True,
+        max_pos=128, sliding_window=4,
+    )
+
+    prompt = torch.tensor([[10, 20, 30, 40, 50]])
+
+    out_cache = model.generate(
+        prompt, max_new_tokens=8, temperature=0.0, top_k=50
+    )
+    out_nocache = model.generate_nocache(
+        prompt, max_new_tokens=8, temperature=0.0, top_k=50
+    )
+
+    assert torch.equal(out_cache, out_nocache), (
+        "sliding_window: generate() and generate_nocache() outputs must match.\n"
+        f"Cache:    {out_cache[0].tolist()}\n"
+        f"NoCache:  {out_nocache[0].tolist()}"
+    )
