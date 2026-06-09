@@ -60,7 +60,7 @@ class GPTModern(nn.Module):
         # Part 2 的 GPT 需要一张"位置查找表"来告知 token 的顺序，
         # 而现代模型改用 RoPE（旋转位置编码），位置信息直接编码进 Q/K 的旋转角度中，
         # 因此不再需要全局的 pos_emb 嵌入层。
-        # self.pos_emb = nn.Embedding(block_size, n_embd)   ← 已弃用
+        # self.pos_emb = nn.Embedding(block_size, n_embd)
 
         self.drop = nn.Dropout(dropout)
 
