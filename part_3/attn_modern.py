@@ -137,9 +137,11 @@ class CausalSelfAttentionModern(nn.Module):
                     v_all = torch.cat([v_all[:, :, :s, :], v_all[:, :, -self.sliding_window:, :]], dim=2)
             else:
                 # ─── 无缓存路径 + 滑动窗口：构造自定义注意力 mask ───
-                # 与旧代码"直接裁剪 K/V 再用 is_causal=True"的方式不同，这里不裁剪 K/V，
-                # 而是构造一张同时包含因果约束和滑窗约束的 mask，避免裁剪导致的索引错位。
-                # mask[i, j] = -inf 当 (j > i) 或 (j < i - sliding_window + 1 且 j >= attention_sink)
+                # 训练 / generate_nocache() 走这个分支。
+                # 注意这里只用纯滑动窗口（因果 + 局部距离约束），
+                # 不使用 attention_sink —— attention_sink 是推理时 RollingKV
+                # 的缓存管理策略（StreamingLLM），不是注意力计算本身的规则。
+                # mask[i, j] = -inf 当 (j > i) 或 (j < i - sliding_window + 1)
                 T_q = q.size(2)
                 T_k = k_all.size(2)
                 # 语法：torch.arange(N) 生成 [0,1,...,N-1]，unsqueeze 扩张维度用于广播比较
@@ -147,9 +149,8 @@ class CausalSelfAttentionModern(nn.Module):
                 col = torch.arange(T_k, device=q.device).unsqueeze(0)  # (1, T_k)
                 # 因果约束：j > i → 遮蔽
                 causal_mask = col > row
-                # 滑窗约束：j < i - W + 1 且 j 不是 sink 锚点 → 遮蔽
-                # attention_sink 个开头的锚点 token 对任意 i 都始终可见（永不滑出窗口）
-                outside_window = (col < row - self.sliding_window + 1) & (col >= self.attention_sink)
+                # 滑窗约束：j < i - W + 1 → 超出局部窗口的旧 token 被遮蔽
+                outside_window = col < row - self.sliding_window + 1
                 # 语法：torch.where(条件, A, B) 条件为 True 取 A（-inf 遮蔽），否则取 B（0 可见）
                 attn_mask = torch.where(causal_mask | outside_window, float('-inf'), 0.0)
                 # SDPA 要求 mask 形状 (B, 1, T_q, T_k) 或可广播到该形状
@@ -201,11 +202,9 @@ class CausalSelfAttentionModern(nn.Module):
                 v_new = torch.cat([kv_cache.v, v], dim=2)
                 new_cache = KVCache(k_new, v_new)
         else:
-            if self.sliding_window is not None:
-                # 首次调用 + 滑动窗口开启：创建 RollingKV 并用当前 K/V 初始化
-                new_cache = RollingKV(window=self.sliding_window, sink=self.attention_sink)
-                new_cache.step(k, v)
-            else:
-                # 首次调用 + 全局注意力：用 KVCache 包装当前 K/V
-                new_cache = KVCache(k, v)
+            # 训练 / 无缓存前向（如 generate_nocache）：
+            # 无论是否开启滑动窗口，都用简单 KVCache 包装当前 K/V。
+            # RollingKV 是推理时的缓存管理策略（维护 sink+window 裁剪），
+            # 训练时缓存不会被后续步骤复用，无需滚动裁剪。
+            new_cache = KVCache(k, v)
         return y, new_cache
