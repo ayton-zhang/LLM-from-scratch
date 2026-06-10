@@ -53,8 +53,7 @@ class CausalSelfAttentionModern(nn.Module):
         self.rope_cache: RoPECache | None = None
         self.max_pos = max_pos
         # sliding_window：局部注意力窗口大小，None 表示全局注意力。
-        # 设为整数 W 时每个 token 只看最近 W 个历史 token，
-        # 长序列时显存从 O(T²) 降至 O(T·W)（Mistral / Phi 的做法）。
+        # 设为整数 W 时每个 token 只看最近 W 个历史 token
         self.sliding_window = sliding_window
         # attention_sink："注意力水槽"，强制保留序列开头 K 个 token 始终在注意力视野中。
         # 即使开了 sliding_window，这些"锚点"也不会被滑出窗口，

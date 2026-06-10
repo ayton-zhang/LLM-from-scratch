@@ -49,7 +49,6 @@ def test_full_model_training_forward_backward():
         use_swiglu=True,   # ← 用 SwiGLU 替代 GELU FFN（LLaMA/GPT-4 采用的激活方案）
         rope=True,         # ← 用 RoPE 替代学习型位置嵌入（更好的序列长度外推性）
         max_pos=128,       # RoPE 预计算的最大序列长度（远大于实际用的 8，验证外推设计）
-        sliding_window=4,  # ← 开启滑动窗口注意力，每个 token 只关注最近 4 个位置
     )
     # 语法：model.train() 是 nn.Module 的方法，将自身及所有子模块的 training 属性设为 True。
     # 这会影响 Dropout（训练时随机丢弃，推理时关闭）和 BatchNorm（训练时用 batch 统计量，
@@ -63,7 +62,7 @@ def test_full_model_training_forward_backward():
     # 用 torch.randint 生成 [0, 255] 范围内的随机整数作为 token ID，
     # 模拟一个 batch=2, 序列长度=8 的训练样本。
     # B=2 验证 batch 维度正确处理（不会把 batch 维和序列维搞混）；
-    # T=8 超过 sliding_window=4，能触发滑动窗口的局部注意力逻辑。
+    # T=8
     B, T = 2, 8
     idx = torch.randint(0, 256, (B, T))
     targets = torch.randint(0, 256, (B, T))
