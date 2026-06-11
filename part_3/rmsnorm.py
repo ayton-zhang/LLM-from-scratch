@@ -1,12 +1,22 @@
 # ==========================================
-# 组件：RMSNorm —— 均方根层归一化
+# 组件：RMSNorm —— 均方根归一化
 # ==========================================
-# 与 Part 2 使用的 LayerNorm 相比，RMSNorm 做了一处关键简化：
-#   LayerNorm : y = (x - mean) / std * γ + β   （需要计算均值和方差，有两个可学习参数 γ、β）
-#   RMSNorm   : y = x / rms(x) * γ             （只计算均方根，省掉均值偏移，只有一个可学习参数 γ）
-# 直觉：LayerNorm 同时做"对齐均值"和"缩放方差"两件事，
-#       RMSNorm 认为"对齐均值"不那么重要，去掉它可以减少约 7% 的计算量，且效果几乎不变。
-# LLaMA / Mistral / GPT-4 等现代大模型均采用 RMSNorm。
+# RMSNorm 是 LayerNorm 的"简化加速版"，被 LLaMA、Mistral、Qwen 等
+# 几乎所有现代大模型采用。与 LayerNorm 的核心区别只有一条：
+#
+#   LayerNorm：y = (x - mean) / std * γ + β    （先去均值，再除标准差）
+#   RMSNorm  ：y = x / rms(x) * g              （只除均方根，不中心化）
+#
+# 为什么去掉 mean 和 bias？
+#   1. 更快：少算一次均值 + 少一个可学习参数 β（bias），
+#      大模型中节省约 5-10% 的前向时间
+#   2. 效果相当：论文和大量实践表明去掉 center 不影响收敛和最终效果
+#   3. LLaMA 选择：Meta 的 LLaMA 系列用 RMSNorm，社区跟随验证了它的有效性
+#
+# 类比：LayerNorm 是"把学生成绩标准化到平均分 0、标准差 1"（做两步），
+#       RMSNorm 是"只除以标准差，不管平均分"（做一步，更快）。
+#       实际效果差不多，因为 Transformer 的残差连接天然起到了一定的
+#       "中心化"作用（x + attn_out 中两部分的均值和方差互相调节）。
 import torch
 import torch.nn as nn
 
@@ -14,31 +24,67 @@ class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization.
     y = x * g / rms(x),   rms(x) = sqrt(mean(x^2) + eps)
     """
+    # ==========================================
+    # 初始化：可学习的缩放参数
+    # ==========================================
     def __init__(self, dim: int, eps: float = 1e-8):
+        # 参数说明：
+        #   dim : 归一化的维度（通常 = n_embd，即隐藏层维度）。
+        #         RMSNorm 沿最后一维（dim=-1）计算均方根，对每个 token 的
+        #         每个特征维度独立归一化。
+        #   eps : 防止除零的小常数（1e-8），加在 rms² 里避免 rms=0 时爆炸。
+        #         为什么 eps 比 LayerNorm 的默认 1e-5 小？因为 rms 没有
+        #         减去均值，数值稳定性更好，可以用更小的 eps。
         super().__init__()
-        # eps（epsilon）是一个极小值，防止分母为零导致数值不稳定。
-        # 默认 1e-8，比 LayerNorm 默认的 1e-5 更小，因为 x^2 的量级通常比 x 更大，
-        # 分母不容易趋近于零，可以设得更小以减少对归一化结果的干扰。
         self.eps = eps
-        # weight（γ）是逐维度的可学习缩放参数，初始化为全 1（即归一化后不做任何缩放）。
-        # 相比 LayerNorm，RMSNorm 没有 bias（β）参数，参数量减少一半。
-        # 语法：nn.Parameter(torch.ones(dim)) 把一个普通张量包装成"可学习参数"，
-        #       PyTorch 会自动把它加入模型的 parameters() 列表，参与梯度更新。
+
+        # weight（论文里叫 g，gain）：可学习的缩放参数，形状 (dim,)。
+        # 归一化后每个特征维度乘上对应的 weight，让模型自己决定"这个维度应该放大还是缩小"。
+        # 初始化为全 1，即刚开始不做任何缩放，让模型在训练中自行调整。
+        #
+        # 注意：RMSNorm 没有 bias（β）参数！LayerNorm 有 weight + bias 两个可学习参数，
+        # RMSNorm 只有 weight 一个。这是"去掉 center"的体现——不需要偏置来补偿去均值。
+        #
+        # 语法：nn.Parameter(tensor) 把普通张量包装成"可训练参数"。
+        # 与普通张量的区别：nn.Parameter 会被 model.parameters() 遍历到，
+        # 从而被优化器自动更新。如果用普通张量存储 weight，优化器会忽略它。
         self.weight = nn.Parameter(torch.ones(dim))
 
+    # ==========================================
+    # forward：RMS 归一化
+    # ==========================================
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 第一步：计算每个向量的均方根（RMS）
-        # x.pow(2)            : 逐元素平方，x² → 形状不变
-        # .mean(dim=-1, ...)  : 沿最后一维（特征维）求均值，得到每个 token 的均方值
-        # keepdim=True        : 保留被压缩的维度，使形状从 (..., dim) → (..., 1)，
-        #                       方便后续广播除法（否则形状对不上）
-        # .add(self.eps)      : 加上极小值防止除以零
-        # .sqrt()             : 开根号得到均方根值
-        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
+        # 输入 x 形状：(B, T, D) 或任意多维，沿最后一维（dim=-1）归一化。
+        # 返回值形状与输入完全相同。
 
-        # 第二步：归一化 + 缩放
-        # x / rms   : 每个 token 的特征向量除以其均方根，将向量"等比例压缩"到单位尺度
-        # * self.weight : 逐维度乘以可学习缩放参数 γ，让模型自行决定每个维度的重要程度
-        # 广播规则：x 形状 (B, T, dim)，rms 形状 (B, T, 1)，
-        #           除法时 1 自动广播到 dim，每个特征维度共享同一个 rms 值。
+        # 逐步拆解 RMS 计算：
+        #
+        #   1. x.pow(2)
+        #      逐元素平方。x 中每个值变成 x²，形状不变。
+        #
+        #   2. .mean(dim=-1, keepdim=True)
+        #      沿最后一维求均值。为什么 keepdim=True？
+        #       不 keepdim：(B, T, D) → (B, T)，少了一维，无法与原始 x 做除法。
+        #       保持维度：(B, T, D) → (B, T, 1)，最后一维大小=1 但维度还在，
+        #       广播时自动扩展到 (B, T, D) 与 x 对齐。
+        #      这是 PyTorch 中"沿某维做统计后还要与原张量运算"的标准写法。
+        #
+        #   3. .add(self.eps)
+        #      加 eps 防止 sqrt(0) = 0 导致除零。
+        #      等价于 x.pow(2).mean(...) + self.eps。
+        #
+        #   4. .sqrt()
+        #      开平方，得到均方根 rms(x) = sqrt(mean(x²) + eps)。
+        #      此时 rms 形状 (B, T, 1)，每个位置一个标量表示"这组特征的 RMS 有多强"。
+        #
+        #   5. x / rms
+        #      广播除法：(B, T, D) / (B, T, 1) → (B, T, D)。
+        #      把每个 token 的 D 维特征除以它的 RMS，使归一化后 RMS ≈ 1。
+        #      直觉：把信号的"音量"调到统一水平，但保留各维度之间的相对比例。
+        #
+        #   6. * self.weight
+        #      广播乘法：(B, T, D) * (D,) → (B, T, D)。
+        #      weight 沿最后一维广播，对每个特征维度做可学习的缩放。
+        #      让模型自己决定"这个特征维度应该强调还是抑制"。
+        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
         return (x / rms) * self.weight

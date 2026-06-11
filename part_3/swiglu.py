@@ -1,58 +1,111 @@
 # ==========================================
-# 组件：SwiGLU —— 门控前馈网络
+# 组件：SwiGLU —— 门控前馈网络（Gated FFN）
 # ==========================================
-# 与 Part 2 的经典 FFN（Linear → GELU → Linear）相比，SwiGLU 引入了"门控机制"：
-#   经典 FFN : y = W3 · GELU(W1 · x)
-#   SwiGLU   : y = W3 · (W1 · x  ⊗  Swish(W2 · x))
-#                          ↑ 值分支    ↑ 门控分支
-# 直觉：把信息流想象成一扇可调光的灯：
-#   - 值分支（W1）产生"原始信息"
-#   - 门控分支（W2 + Swish）产生 0~1 之间的"亮度旋钮"
-#   - 两者逐元素相乘，让网络自行决定每个维度"放多少信息通过"
-# Swish(x) = x · sigmoid(x)，是 SiLU 的别名，比 GELU 更平滑，梯度更稳定。
-# LLaMA / PaLM / GPT-4 等现代大模型均采用 SwiGLU 作为 FFN。
+# SwiGLU 是现代大模型（LLaMA、Mistral、Gemma）标配的前馈网络，
+# 替代了传统 Transformer 的 GELU/ReLU 两层 MLP。
+#
+# 核心创新：引入"门控机制"——让网络自己决定"哪些信息应该通过，哪些应该过滤掉"。
+#
+# 数学公式：
+#   SwiGLU(x) = (x · W1) ⊙ SiLU(x · W2) · W3
+#                     ↑                ↑        ↑
+#                  "内容分支"      "门控分支"   "输出投影"
+#
+#   其中 SiLU(x) = x · sigmoid(x)（也叫 Swish 激活函数），
+#   ⊙ 表示逐元素乘法（Hadamard product）。
+#
+# 与普通 MLP 的对比：
+#   普通 MLP（GELU）：  y = GELU(x · W_up) · W_down
+#                      一个线性投影 → 激活 → 另一个线性投影
+#
+#   SwiGLU：           y = (x · W1) ⊙ SiLU(x · W2) · W3
+#                      两个并行的线性投影 → 门控乘法 → 输出投影
+#
+# 直觉类比：普通 MLP 是"一条传送带"（信息流过激活函数），
+#          SwiGLU 是"两条传送带 + 一个闸门"——
+#            W1 产生"内容"（我想表达什么）
+#            W2 产生"门控信号"（这段内容有多重要？0=全过滤，1=全通过）
+#            ⊙  把内容和门控逐元素相乘，门控小的维度被"关掉"，大的被"放大"
+#            W3 把筛选后的信息投影回原始维度
+#
+# 为什么更好？门控机制让模型学到"稀疏激活"——不是所有特征维度都需要同时激活，
+# 只有门控信号认为重要的维度才被保留。这带来了更强的非线性表达能力，
+# 同时参数量约是普通 MLP 的 1.5 倍（两个 W1/W2 而非一个 W_up），
+# 换来了显著的效果提升（perplexity 更低）。
+#
+# 关于 mult 参数的注意事项：
+#   普通 MLP 的 mult=4 表示 inner_dim = 4 * dim（如 dim=256 → 中间 1024 维）。
+#   SwiGLU 的 mult=4 也表示 inner_dim = 4 * dim，但实际参数量更大——
+#   因为有两个 dim→inner 的投影矩阵（W1 和 W2），再加上一个 inner→dim 的 W3。
+#   LLaMA 的做法是用 mult = 8/3 ≈ 2.67 来让参数量与 mult=4 的普通 MLP 持平。
+#   这里用 mult=4 是简化实现，参数稍多但效果更好。
 import torch.nn as nn
 
 class SwiGLU(nn.Module):
     """SwiGLU FFN: (xW1) ⊗ swish(xW2) W3  with expansion factor `mult`.
     """
+    # ==========================================
+    # 初始化：三个线性投影 + SiLU 激活 + Dropout
+    # ==========================================
     def __init__(self, dim: int, mult: int = 4, dropout: float = 0.0):
+        # 参数说明：
+        #   dim     : 输入/输出维度（= n_embd，隐藏层维度）
+        #   mult    : 中间层扩展倍数，inner = mult * dim
+        #   dropout : 随机丢弃率，训练时在输出投影后随机置零部分元素
         super().__init__()
-        # inner 是隐藏层维度，默认为输入维度的 4 倍（与经典 FFN 扩张比一致）。
-        # 注意：SwiGLU 有两条并行的上投影（w1、w2），参数量约为经典 FFN 的 1.5 倍，
-        # 实践中常把 mult 调小到 ~2.67 以保持总参数量不变（LLaMA 的做法）。
-        inner = mult * dim
+        inner = mult * dim  # 中间层维度：信息被"展开"到更高维空间做变换
 
-        # w1：值分支的上投影，把 dim 维输入映射到 inner 维"原始信息"。
-        # bias=False：现代大模型普遍去掉线性层的偏置，减少参数量且效果相当。
+        # w1："内容分支"的投影矩阵，(dim → inner)。
+        # 把输入投影到高维空间，产生"候选内容"。
         self.w1 = nn.Linear(dim, inner, bias=False)
 
-        # w2：门控分支的上投影，把 dim 维输入映射到 inner 维"门控信号"。
-        # w1 和 w2 接收相同的输入 x，但学习不同的投影方向，分别扮演不同角色。
+        # w2："门控分支"的投影矩阵，(dim → inner)。
+        # 与 w1 输入相同但权重独立，产生"门控信号"——
+        # 每个维度的值经过 SiLU 后落在 (0, +∞) 或约 (-0.28, +∞) 范围，
+        # 小值/负值趋向 0（门关闭），大正值趋向原值（门打开）。
         self.w2 = nn.Linear(dim, inner, bias=False)
 
-        # w3：下投影，把门控后的 inner 维特征压缩回 dim 维，与残差路径形状对齐。
+        # w3：输出投影，(inner → dim)。
+        # 把门控筛选后的高维信息压缩回原始维度。
         self.w3 = nn.Linear(inner, dim, bias=False)
 
-        # SiLU（Sigmoid Linear Unit）即 Swish 激活函数：f(x) = x · σ(x)
-        # 与 ReLU 相比：无硬性截断，x<0 时仍有微小梯度，训练更稳定；
-        # 与 GELU 相比：计算更简单（无需近似），且经实验在门控结构中效果更好。
-        self.act = nn.SiLU()
+        # SiLU 激活函数（也叫 Swish）：
+        #   SiLU(x) = x * sigmoid(x)
+        #   形状像一个"平滑版 ReLU"：
+        #     x << 0：输出接近 0（门关闭）
+        #     x = 0 ：输出 = 0（过渡点）
+        #     x >> 0：输出 ≈ x（门全开，信息直接通过）
+        # 比 ReLU 好在处处可导（平滑），比 GELU 好在计算更快（只需 sigmoid）。
+        self.act = nn.SiLU()  # SiLU = Swish activation
 
-        # Dropout 施加在最终输出上，随机将部分特征置零，防止过拟合。
-        # dropout=0.0 时 nn.Dropout 相当于恒等映射，推理时自动关闭。
+        # Dropout：训练时随机丢弃输出投影后的部分元素，防止过拟合。
+        # 推理时（model.eval()）自动透传，不做丢弃。
         self.drop = nn.Dropout(dropout)
 
+    # ==========================================
+    # forward：门控前向传播
+    # ==========================================
     def forward(self, x):
-        # 值分支：线性投影，形状 (B, T, dim) → (B, T, inner)
+        # 输入 x 形状：(B, T, dim)，来自 Block 的 self.ln2(x)。
+        # 返回值形状：(B, T, dim)，与输入相同（FFN 的输出加回残差）。
+
+        # ─── 第一步：内容分支投影 ───
+        # w1(x) 形状：(B, T, dim) → (B, T, inner)
+        # 产生"候选内容"：每个 token 的每个特征维度在 inner 维空间中的表达。
         a = self.w1(x)
 
-        # 门控分支：线性投影后过 SiLU 激活，产生 0~∞ 的"软门"信号。
-        # 形状同样 (B, T, dim) → (B, T, inner)
+        # ─── 第二步：门控分支投影 + 激活 ───
+        # w2(x) → SiLU： (B, T, dim) → (B, T, inner) → SiLU → (B, T, inner)
+        # 产生"门控信号"：SiLU 后接近 0 的维度被"关门"，
+        # 正值大的维度被"开门"，让对应的内容通过。
         b = self.act(self.w2(x))
 
-        # 门控融合：a * b 是逐元素乘法（Hadamard 积），
-        # 让门控分支 b 决定值分支 a 中每个维度"保留多少"。
-        # 再经 w3 下投影压缩回 dim 维，最后 Dropout 防止过拟合。
-        # 形状：(B, T, inner) → (B, T, dim)
+        # ─── 第三步：门控乘法 + 输出投影 + Dropout ───
+        # a * b：逐元素乘法（Hadamard product），形状 (B, T, inner)。
+        #   门控信号 b 对内容 a 做"选择性过滤"——
+        #   被关门的维度（b≈0）→ 内容被清零
+        #   被开门的维度（b≈1+）→ 内容原样通过（或放大）
+        #   被半开的维度（0<b<1）→ 内容被衰减
+        # w3(...)：输出投影 (B, T, inner) → (B, T, dim)，回到原始维度。
+        # Dropout(...)：训练时随机丢弃，推理时透传。
         return self.drop(self.w3(a * b))
