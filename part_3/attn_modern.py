@@ -178,18 +178,6 @@ class CausalSelfAttentionModern(nn.Module):
         #   - 前 attention_sink 个"锚点" token（永不丢弃）
         #   - 后 sliding_window 个"最近窗口" token
         # 中间被裁掉的旧 token 信息永久丢失（缓存显存固定的代价）。
-        #
-        # 为什么需要 attention_sink？StreamingLLM 论文发现：LLM 会自发把大量注意力分数
-        # "倾倒"到序列开头的几个 token 上（称为 attention sink）。如果把这些 token 也裁掉，
-        # 模型的注意力分布会急剧恶化（perplexity 飙升）。因此即使开滑动窗口，
-        # 也要保留最开头的几个 token 作为"注意力垃圾桶"。
-        #
-        # 训练时的行为：如果序列长度 T > sink+window，也会触发裁剪。
-        # 此时 K/V 被裁短（如从 T=8 裁到 4），后续使用 is_causal=True，
-        # 注意：裁剪后 K/V 的"绝对位置"变了（原来位置 4-7 变成 0-3），
-        # 而 causal mask 认为它们从 0 开始——这对训练有轻微影响，
-        # 实际应用中滑动窗口通常在训练时通过自定义 mask 实现，而非直接裁剪。
-        # Sliding-window + attention-sink (crop along seq length)
         if self.sliding_window is not None and k_all.size(2) > (self.sliding_window + self.attention_sink):
             # s：sink（水槽）大小，即强制保留的开头 token 数。
             s = self.attention_sink

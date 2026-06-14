@@ -97,9 +97,11 @@ if __name__ == "__main__":
     # argparse.ArgumentParser() 创建一个命令行参数解析器。
     # 把用户敲的 --demo 之类选项转成结构化的 Python 对象，无需手写 if '--demo' in sys.argv。
     p = argparse.ArgumentParser()
-    # action="store_true"：如果用户传了 --demo，args.demo 就是 True；
-    # 如果没传，args.demo 默认 False。不需要 --demo True/False 这种冗余写法。
-    p.add_argument("--demo", action="store_true", help="run a tiny generation demo")
+    # --demo 默认启用：直接 debug orchestrator.py 就会走完整流程（测试 + 生成演示），
+    # 覆盖所有组件的 forward / backward / KV Cache 细节，适合学习时单步跟踪。
+    # 如果只想跑测试、跳过生成演示，加 --skip-demo 即可。
+    p.add_argument("--skip-demo", action="store_true",
+                   help="skip the generation demo, run tests only")
     # p.parse_args() 解析 sys.argv（命令行参数列表），返回包含解析结果的命名空间对象。
     args = p.parse_args()
 
@@ -125,7 +127,7 @@ if __name__ == "__main__":
     #   --tokens 200              : 生成 200 个新 token
     # 共计生成 prompt(5) + 200 = 205 个 token，远超窗口 64，可以观察滑动窗口
     # 裁剪效果 + attention sink 保留开头 token 的行为。
-    if args.demo:
+    if not args.skip_demo:
         run(f"{sys.executable} demo_generate.py --rmsnorm --rope --swiglu --sliding_window 64 --sink 4 --tokens 200")
 
     # 全部通过，打印成功标记。

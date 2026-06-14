@@ -153,11 +153,6 @@ class GPTModern(nn.Module):
         B, T = idx.shape
         assert T <= self.block_size  # 防止输入超过模型设计的最大上下文长度
 
-        # pos：当前批次中每个 token 的位置索引，形状 (1, T)，值 [0, 1, 2, ..., T-1]。
-        # 注意：这里创建了 pos 但没有使用。在之前的版本中 pos 用于查找 pos_emb 表
-        # （Part 2 的做法），现在 RoPE 已接管位置编码，这个变量的计算可以移除。
-        # 保留在此是为了代码演进的可追溯性——展示从 Part 2 到 Part 3 的变化历史。
-        pos = torch.arange(0, T, device=idx.device).unsqueeze(0)
 
         # ─── 第一步：词嵌入 ───
         # 把 token ID 查表转为向量：(B, T) → (B, T, n_embd)。
@@ -276,7 +271,7 @@ class GPTModern(nn.Module):
         for _ in range(max_new_tokens):
             # ─── KV Cache 的核心逻辑：决定喂多少 token 给模型 ───
             # Prefill（kvs[0] is None）：缓存为空 → 要把整个 prompt 喂进去建立缓存。
-            #   但也要截断到 block_size，防止超长 prompt 溢出。
+            #   但也要截断到 block_size，防止超长 prompt 溢出，并且只看最新的 block_size 个 token（模型设计的最大上下文）。
             # Decode（kvs[0] 已填充）：历史 K/V 已缓存 → 只需喂最新 1 个 token。
             #   这样计算量恒定为 O(1)，不随序列长度增长。
             # feed full prompt once; then only the last token
