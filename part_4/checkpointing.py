@@ -98,8 +98,19 @@ def _log_model_stats(logger, model, step: int, do_hists: bool = False):
         # 冻结参数不会被优化器更新，混进来会让“训练状态”指标失真。
         params = [p for p in model.parameters() if p.requires_grad]
 
-        # 每个参数张量先算自己的 L2 范数，再把所有参数范数堆起来算全局 L2。
-        # 这相当于观察整模型权重规模是否异常变大。
+        # 这行代码从内向外执行：
+        # 1. [p.detach().norm(2) for p in params] 是列表推导式：
+        #    for p in params 逐个取出模型参数 p，并执行前面的表达式。
+        # 2. p.detach() 返回一个与 p 共享数据、但脱离 autograd 计算图的张量。
+        #    这里只统计数值，不需要反向传播，因此 detach 可避免记录无用的梯度计算。
+        # 3. .norm(2) 计算单个参数张量的 L2 范数，即 sqrt(sum(p_i**2))；
+        #    无论参数原本是一维、二维还是更高维，结果都是一个标量张量。
+        # 4. torch.stack([...]) 把这些标量张量沿一个新维度拼成一维张量。
+        #    例如三个参数的范数为 a、b、c，stack 后得到 tensor([a, b, c])。
+        # 5. 外层 torch.norm(..., 2) 再计算这个一维张量的 L2 范数，
+        #    得到 sqrt(a**2 + b**2 + c**2)，也就是整个模型所有参数的全局 L2 范数。
+        # 6. .item() 从只含一个元素的张量中取出数值，转换为普通 Python 标量，
+        #    便于写入日志。该指标可用于观察整模型权重是否异常增大或缩小。
         total_param_norm = torch.norm(torch.stack([p.detach().norm(2) for p in params]), 2).item()
 
         # 梯度可能为 None：例如刚 zero_grad(set_to_none=True) 后，或者某些参数本轮未参与计算。
@@ -221,14 +232,39 @@ def _log_runtime(logger, step: int, it_t0: float, xb, device):
     try:
         # 当前 step 从开始到现在耗时多少秒。
         dt = time.time() - it_t0
-        # xb 形状通常是 (B, T)，numel() 就是本 micro-batch 的 token 数 B*T。
+        # xb 是送入模型的 token ID 张量，通常形状为 (B, T)：
+        #   B（batch size）表示这个 micro-batch 中有多少条文本序列；
+        #   T（sequence length）表示每条序列包含多少个 token。
+        # Tensor.numel() 返回张量中所有元素的总数，因此对于形状 (B, T) 的 xb，
+        # xb.numel() 等于 B * T。xb 中每个元素都是一个 token ID，所以这个元素总数
+        # 也就是当前 micro-batch 实际送入模型的 token 数。
+        # int(...) 将结果明确转换为普通 Python 整数，便于后续做除法和写入日志。
+        # 例如 xb.shape == (8, 512) 时，toks == 8 * 512 == 4096。
         toks = int(xb.numel())
         # tokens/s 是训练吞吐量，越高说明硬件利用越充分。
         # max(dt, 1e-6) 防止极端情况下除以 0。
         toks_per_s = toks / max(dt, 1e-6)
-        # CUDA 可用时记录已分配显存，单位从 bytes 转成 MiB。
-        # CPU 训练时记 0，保持日志字段一致。
+        # 这是 Python 的条件表达式，语法为：
+        #   条件成立时的值 if 条件 else 条件不成立时的值
+        # torch.cuda.is_available() 用来判断当前 PyTorch 环境能否使用 CUDA。
+        # CUDA 可用时，torch.cuda.memory_allocated() 返回当前 CUDA 设备上，
+        # 由 PyTorch 张量实际占用的显存字节数；它不等于 GPU 的全部显存占用，
+        # 也不包含 PyTorch 缓存分配器已保留但当前没有被张量使用的那部分显存。
+        # 1024**2 表示 1024 的平方，即 1,048,576；bytes 除以它后转换为 MiB。
+        # CUDA 不可用时返回 0.0，使 CPU 训练也拥有相同的日志字段。
         mem = torch.cuda.memory_allocated()/(1024**2) if torch.cuda.is_available() else 0.0
+        # logger.log(...) 写入当前训练步的运行指标：
+        #   step=step：关键字参数，指定这些指标属于哪个训练 step；
+        #   {...}：一个字典，键是指标名称，值是需要记录的数值；
+        #   **字典：Python 的关键字参数解包语法，相当于把字典中的每个
+        #           “键: 值”展开成“参数名=参数值”传给 logger.log。
+        # 例如 **{"sys/step_time_s": dt} 等价于传入
+        # sys/step_time_s=dt 的含义；因为参数名包含 /，不能直接写成普通关键字，
+        # 所以这里必须借助字典和 ** 解包。
+        # sys/ 前缀用于把系统运行指标归为一组，方便在 TensorBoard 中查看：
+        #   throughput_tokens_per_s：每秒处理的 token 数；
+        #   step_time_s：当前 step 的耗时，单位为秒；
+        #   gpu_mem_alloc_mb：PyTorch 当前已分配的 GPU 显存，单位为 MiB。
         logger.log(step=step, **{
             "sys/throughput_tokens_per_s": toks_per_s,
             "sys/step_time_s": dt,
@@ -478,7 +514,7 @@ def atomic_save_all(model, optim, sched, amp, step: int, out_dir: Path,
     # model_last.pt 方便“默认恢复最近一次”，model_stepxxxx.pt 方便回退到某个历史点。
     per_step, last = checkpoint_paths(out_dir, step)
     try:
-        # copy2 会复制文件内容和部分元数据，例如修改时间。
+        # shutil.copy2(源文件, 目标文件)，复制源文件到目标文件，并尽量保留元数据（修改时间、权限等）。
         shutil.copy2(last, per_step)
     except Exception:
         # 归档副本失败时不影响 model_last.pt，至少最近 checkpoint 已经保存。
@@ -486,11 +522,20 @@ def atomic_save_all(model, optim, sched, amp, step: int, out_dir: Path,
 
     # GC old per-step checkpoints
     try:
-        # glob("model_step*.pt") 找出所有按步数归档的 checkpoint。
-        # 因为文件名数字补零，sorted 后就是从旧到新的顺序。
+        # out_dir.glob("model_step*.pt")：
+        #   在 out_dir 目录中查找符合该模式的文件，其中 * 表示任意数量的任意字符。
+        #   例如 model_step0000050.pt 会被匹配，并返回一个可迭代对象。
+        # sorted(...) 将匹配结果按文件路径从小到大排序。
+        # 由于文件名中的 step 已补齐为相同位数，排序结果也就是从旧 checkpoint 到新 checkpoint。
         ckpts = sorted(out_dir.glob("model_step*.pt"))
-        # 只保留最后 keep_last_k 个，前面的旧文件删除，防止磁盘被 checkpoint 填满。
+        # ckpts[:-keep_last_k] 是列表切片：
+        #   -keep_last_k 表示“倒数第 keep_last_k 个元素”的位置；
+        #   省略切片起点表示从列表开头取到该位置，但不包含该位置。
+        # 例如 keep_last_k=3 时，[A, B, C, D, E][:-3] 得到 [A, B]，
+        # 因此 for 循环只遍历需要删除的旧 checkpoint，最后 3 个会被保留。
         for old in ckpts[:-keep_last_k]:
+            # old 是本次循环取出的 Path 对象。
+            # unlink() 删除该文件；missing_ok=True 表示文件已经不存在时也不抛出异常。
             old.unlink(missing_ok=True)
     except Exception:
         pass
