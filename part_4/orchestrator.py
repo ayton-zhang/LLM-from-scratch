@@ -19,8 +19,8 @@
 #
 # 用法：
 #   cd part_4
-#   python orchestrator.py           # 只跑测试
-#   python orchestrator.py --demo    # 跑测试 + 烟雾训练 + 采样
+#   python orchestrator.py            # 跑测试 + 烟雾训练 + 采样（默认）
+#   python orchestrator.py --no-demo  # 只跑测试
 
 # Repository layout (Part 4)
 #
@@ -78,9 +78,10 @@ def run(cmd: str):
 # 语法：`if __name__ == "__main__":` Python 的标准入口守卫。
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    # --demo 是可选的：不加只跑测试，加了才跑烟雾训练 + 采样。
-    # action="store_true"：传了为 True，没传为 False。
-    p.add_argument("--demo", action="store_true", help="run a tiny smoke train+sample")
+    # --no-demo：不加则默认跑烟雾训练 + 采样，加了则跳过。
+    # action="store_false" + default=True：传了为 False，没传为 True。
+    p.add_argument("--no-demo", action="store_false", dest="demo", default=True,
+                    help="skip the smoke train+sample demo (demo runs by default)")
     args = p.parse_args()
 
     # ─── 第一步：运行单元测试 ───
