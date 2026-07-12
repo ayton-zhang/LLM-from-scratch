@@ -240,7 +240,10 @@ def main():
             )
         # tokenizer_dir.txt 记录了分词器的保存路径。
         # 断点续训时必须用同一分词器（词表变了 embedding 维度会错位）。
-        # TODO:with_name这里的语法不太懂
+        # 语法：Path.with_name("新文件名") 只替换文件名部分，保留父目录不变。
+        # 例如 ckpt_path = Path("ckpts/model.pt")
+        #     → with_name("tokenizer_dir.txt") → Path("ckpts/tokenizer_dir.txt")
+        # 效果等价于 ckpt_path.parent / "tokenizer_dir.txt"，但更简洁。
         tok_file = ckpt_path.with_name("tokenizer_dir.txt")
         saved_tok_dir = tok_file.read_text().strip() if tok_file.exists() else None
 
@@ -425,6 +428,10 @@ def main():
         try:
             # next(iter(train_loader))：取 DataLoader 的第一个 batch。
             # iter() 创建迭代器，next() 取下一个元素。
+            # 语法：`iter()` 和 `next()` 是 Python 迭代器协议的核心内置函数：
+            #   iter(obj)  → 调用 obj.__iter__()，返回一个迭代器对象
+            #   next(itr)  → 调用 itr.__next__()，返回下一个元素
+            #   等价于 for 循环的第一步"取第一个 batch 就停下"，比 for + break 更直接。
             ex_x, ex_y = next(iter(train_loader))
             _maybe_log_graph_tb(logger, model, ex_x.to(device), ex_y.to(device))
         except Exception:
@@ -475,9 +482,12 @@ def main():
     model.train()
 
     while step < args.steps:
-        # 语法：`for xb, yb in train_loader:` 遍历 DataLoader。
-        # train_loader 每次 yield 一个 (xb, yb) 元组，xb 是输入 token ID，
-        # yb 是目标 token ID（xb 右移一位）。xb/yb 形状均为 (B, T)。
+        # 语法：`for xb, yb in train_loader:` 在 for 循环中使用元组解包。
+        # train_loader 每次 yield 一个 (xb, yb) 二元组，
+        # Python 直接把元组的两个元素解包赋值给 xb 和 yb，
+        # 比写 `for batch in loader: xb, yb = batch` 更简洁。
+        # xb 是输入 token ID，yb 是目标 token ID（xb 右移一位）。
+        # xb/yb 形状均为 (B, T)，dtype=torch.long。
         # 每轮 for 循环遍历完整个数据集（1 epoch），然后 while 循环判断是否继续。
         for xb, yb in train_loader:
             # 双重检查：for 循环内部也要检查步数上限（防止 DatLoader 没读完就超了）
@@ -497,6 +507,9 @@ def main():
             it_t0 = time.time()
             # .to(device)：如果数据在 CPU 上而模型在 GPU 上，把数据搬到 GPU。
             # 这是每步都必须做的操作（DataLoader 产出的数据默认在 CPU）。
+            # 语法：`.to(device)` 把张量从 CPU 搬运到 GPU（如果已在目标设备上则无操作）。
+            # xb 形状 (B, T)，dtype=long（token ID 必须是整数）。
+            # yb 形状 (B, T)，是 xb 右移一位的结果——模型的任务是"看到 xb，预测 yb"。
             xb, yb = xb.to(device), yb.to(device)
 
             # ─── 第 1 步：前向传播（AMP 混精）───
@@ -507,14 +520,22 @@ def main():
             #   softmax、normalization 等对精度敏感的操作仍用 FP32。
             #   非 CUDA 设备（CPU）上 enabled=False，整个上下文块什么都不做。
             with torch.cuda.amp.autocast(enabled=amp.amp):
-                # model(xb, yb) 的内部调用链：
-                #   tok_emb(xb) → Block_0.forward(..., kv_cache=None) →
-                #   ... → Block_N-1.forward(...) → ln_f → head → cross_entropy
-                # 返回值：(logits, loss, caches)
+                # model(xb, yb) 的内部调用链（张量形状变化追踪）：
+                #   xb (B, T, dtype=long)
+                #   → tok_emb: (B, T) → (B, T, C)         词嵌入查表
+                #   → Block_0..Block_{N-1}: (B, T, C) → (B, T, C)  每层输出与输入形状相同
+                #   → ln_f: (B, T, C) → (B, T, C)         最终归一化
+                #   → head: (B, T, C) → (B, T, vocab_size) 投影到词表维度
+                #   → cross_entropy: (B, T, vocab_size) vs yb (B, T) → 标量 loss
+                #
+                # 语法：`logits, loss, _ = model(...)` 是多返回值解包（Tuple Unpacking）。
+                #   model.forward() 返回一个 (logits, loss, kvs) 三元组，
+                #   Python 直接把三个元素分配给左边三个变量。
+                #   下划线 `_` 是 Python 惯例——"我知道这里有返回值，但我不需要它"。
+                #   训练时不需要 KV Cache（kvs 总为 None 的列表），用 _ 明确丢弃。
                 #   logits: (B, T, vocab_size)  每个位置对每个 token 的预测得分
                 #   loss: 标量，交叉熵 = -log(P(正确token|上文)) 的平均值
-                #   caches: [KVCache_0, ..., KVCache_{N-1}]  训练时不需要
-                # _ 忽略 caches，因为训练不用 KV Cache
+                #   kvs: [None, ..., None]  训练时 KV Cache 不激活
                 logits, loss, _ = model(xb, yb)
 
             # ─── 第 2 步：反向传播（梯度累积）───
@@ -550,7 +571,9 @@ def main():
                 # ─── 第 5 步：更新学习率 ───
                 # sched.step() 根据当前步数和预设曲线（warmup→cosine）更新 optimizer 的 lr。
                 # 每次 scheduler.step()，optimizer 每个参数组的 lr 都被重新计算。
-                # 返回值是当前步的学习率（用于日志记录）。
+                # 语法：sched.step() 返回当前步的学习率值（Python float），
+                #   而非 PyTorch 张量。这是 WarmupCosineLR 特意设计的——
+                #   内部用 float 算 lr 后直接返回，省去从张量中 .item() 的步骤。
                 lr = sched.step()
 
                 # step 只在真正更新参数后才 +1（梯度累积的中间步不计入 step）。
@@ -586,7 +609,10 @@ def main():
                 # logging
                 if step % 50 == 0:
                     # 1. 基础标量：loss 和 learning rate
-                    #    loss.item() 把 0 维张量转 Python float（脱离计算图，省显存）
+                    #    语法：loss.item() 把 0 维 PyTorch 张量（标量 tensor）转成 Python float。
+                    #      PyTorch 张量即使只有 1 个值，也还连着计算图（占用显存），
+                    #      .item() 把它从 GPU 搬出来、切断计算图，变成一个干净的 Python 数字。
+                    #    float() 外层包装确保类型一致（.item() 本身返回 float，这里是防御性写法）。
                     logger.log(step=step, loss=float(loss.item()), lr=float(lr))
                     # 2. 运行时统计：tokens/second（吞吐量）、GPU 显存使用量
                     #    这是衡量"训练是否在有效利用硬件"的关键指标。
@@ -594,6 +620,8 @@ def main():
                     # 3. 模型统计：权重范数、梯度范数
                     #    梯度范数突然飙升（如从 1.0 跳到 1000.0）→ 梯度爆炸，需要调低 lr
                     #    梯度范数持续接近 0 → 梯度消失，或学习率太低
+                    #    do_hists=False：不记录参数/梯度的直方图分布（每 50 步画直方图太贵），
+                    #    只记录标量统计量（L2 范数、最大值等），I/O 开销小得多。
                     _log_model_stats(logger, model, step, do_hists=False)
                     # 4. 注意力可视化（每 100 步一次，every=100）
                     #    记录各层注意力的平均模式——模型在关注哪些位置？
