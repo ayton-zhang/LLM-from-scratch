@@ -4,15 +4,15 @@
 #
 # 这个脚本是整个 Part 5 的"一键检查"入口：
 #   1. 依次运行三个单元测试文件，验证门控、MoE 前向传播、混合 Block 的正确性
-#   2. 可选（--demo）：跑一遍 demo_moe.py，输出路由直方图等可视化信息
+#   2. 默认：跑一遍 demo_moe.py，输出路由直方图等可视化信息（--no-demo 可跳过）
 #
 # 设计思路：
 #   单元测试覆盖边界情况（形状、dtype、组合方式），而 demo 则是集成验证，
 #   确保所有组件拼在一起能正常运行。两者结合 = 快速反馈 + 端到端信心。
 #
 # 运行方式（在 part_5/ 目录下）：
-#   python orchestrator.py          # 只跑测试
-#   python orchestrator.py --demo   # 跑测试 + MoE demo
+#   python orchestrator.py              # 跑测试 + MoE demo（默认）
+#   python orchestrator.py --no-demo    # 只跑测试，跳过 demo
 
 # ==========================================
 # 导入区：标准库工具
@@ -49,7 +49,18 @@ def run(cmd: str):
 
     参数:
         cmd : 要执行的命令字符串，如 "python -m pytest -q tests/test_gate_shapes.py"
+              字符串中的 "python" 会被自动替换为 sys.executable（当前解释器路径），
+              避免不同系统上 python/python3 命名不一致的问题。
     """
+    # ─── 用当前 Python 解释器路径替换硬编码的 "python" ───
+    # 语法：sys.executable 返回当前正在运行的 Python 解释器的绝对路径。
+    #   例如：/usr/bin/python3 或 /home/user/miniconda3/bin/python
+    # 为什么这么做？
+    #   不同系统（Linux/macOS/Windows）和不同环境（系统 Python/conda/venv）中，
+    #   可执行文件可能叫 python、python3、python3.10 等，直接写死 "python"
+    #   会导致 FileNotFoundError。用 sys.executable 保证找到的一定是同一个解释器。
+    cmd = cmd.replace("python", sys.executable, 1)
+
     # 打印命令，方便用户看到当前正在执行哪一步
     print(f"\n>>> {cmd}")
 
@@ -76,11 +87,15 @@ if __name__ == "__main__":
     # argparse.ArgumentParser：创建一个命令行参数解析器
     p = argparse.ArgumentParser()
 
-    # 语法：p.add_argument("--demo", action="store_true", help="...")
-    #   --demo           → 标志名，命令行中用 --demo 传入
-    #   action="store_true" → 如果用户提供了 --demo，args.demo 为 True；否则默认 False
-    #   help="..."       → 运行 python orchestrator.py --help 时显示的说明文字
-    p.add_argument("--demo", action="store_true", help="run a tiny MoE demo")
+    # 语法：两个互斥标志共享同一个 dest="demo"：
+    #   --demo     → action="store_true"  将 args.demo 设为 True
+    #   --no-demo  → action="store_false" 将 args.demo 设为 False
+    #   default=True → 不传任何标志时，args.demo 默认为 True（即默认跑 demo）
+    # 这种 --flag / --no-flag 的模式比单一 --flag 更灵活，
+    # 用户无需记忆"默认值是什么"就能显式开启或关闭。
+    p.add_argument("--demo", dest="demo", action="store_true", help="run a tiny MoE demo (default)")
+    p.add_argument("--no-demo", dest="demo", action="store_false", help="skip the MoE demo")
+    p.set_defaults(demo=True)
     args = p.parse_args()
 
     # ─── 阶段 1：运行单元测试（始终执行）───
@@ -93,7 +108,7 @@ if __name__ == "__main__":
     run("python -m pytest -q tests/test_moe_forward.py")
     run("python -m pytest -q tests/test_hybrid_block.py")
 
-    # ─── 阶段 2：可选 MoE 演示（仅 --demo 时执行）───
+    # ─── 阶段 2：MoE 演示（默认执行，--no-demo 跳过）───
     # 演示用一个小型 MoE 模型跑一次前向传播，输出 token 到专家的路由分布直方图，
     # 直观展示"哪些专家被选中的多、哪些少"——这对理解负载均衡非常重要。
     # 参数说明：
