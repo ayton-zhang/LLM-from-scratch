@@ -241,7 +241,7 @@ class TopKGate(nn.Module):
         #
         #   load 初始: [0, 0, 0, 0]
         #
-        #   scatter_add_ 逐个读取 hard1 中的编号，把 ones 中对应的值"加到"load 的对应位置：
+        #   ！！！scatter_add_ 逐个读取 hard1 中的编号，把 ones 中对应的值"加到"load 的对应位置：
         #
         #     位置 k=0: hard1[0]=0 → load[0] += 1 → load = [1, 0, 0, 0]
         #     位置 k=1: hard1[1]=2 → load[2] += 1 → load = [1, 0, 1, 0]
