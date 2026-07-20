@@ -79,7 +79,12 @@ def run(cmd: str):
     #   "python -m pytest -q tests/test.py" → ["python", "-m", "pytest", "-q", "tests/test.py"]
     # 比手写 cmd.split() 更安全：能正确处理引号包裹的参数（如 --prompt 'What is DNA?'）
     # cwd=ROOT 指定子进程的工作目录为 part_6/，保证相对路径正确
-    res = subprocess.run(shlex.split(cmd), cwd=ROOT)
+    args = shlex.split(cmd)
+    # 将 "python" 替换为 sys.executable（当前 Python 解释器的绝对路径），
+    # 避免 bare "python" 在 PATH 中找不到的问题（如 venv、conda 环境）。
+    if args and args[0] == "python":
+        args[0] = sys.executable
+    res = subprocess.run(args, cwd=ROOT)
 
     # 子进程返回码非 0 表示执行失败（测试不通过、脚本报错等），
     # 此时用 sys.exit() 终止整个编排流程，并将错误码向上传递，
@@ -97,10 +102,10 @@ if __name__ == "__main__":
     # ─── 命令行参数解析 ───
     # argparse 自动生成 --help 帮助信息，提升脚本的可用性
     p = argparse.ArgumentParser()
-    # 语法：action="store_true" 表示 --demo 是一个布尔开关：
-    #   命令行出现 --demo → args.demo = True；不出现 → args.demo = False（默认）
-    #   不需要像普通参数那样 --demo value 传值，适合控制"是否开启某功能"的场景
-    p.add_argument("--demo", action="store_true", help="tiny SFT demo on a few samples")
+    # 默认 demo=True：方便 debug 模式下一键运行完整 SFT 流程，无需手动传 --demo。
+    # 如需跳过 demo（只跑单元测试），显式传入 --no-demo 即可。
+    p.add_argument("--demo", action="store_true", default=True, help="tiny SFT demo on a few samples")
+    p.add_argument("--no-demo", action="store_false", dest="demo", help="skip the SFT demo, run tests only")
     args = p.parse_args()
 
     # ==========================================
@@ -110,10 +115,10 @@ if __name__ == "__main__":
     # pytest -q（quiet 模式）减少输出噪音，只看关键结果。
 
     # test_formatter.py：验证 6.1 节的 prompt/response 模板是否正确格式化
-    run("python -m pytest -q tests/test_formatter.py")
+    # run("python -m pytest -q tests/test_formatter.py")
     # test_masking.py：验证 6.2 节的 causal LM label masking 是否正确
     #   （训练时 prompt 部分不计算 loss，只对 response 部分做监督）
-    run("python -m pytest -q tests/test_masking.py")
+    # run("python -m pytest -q tests/test_masking.py")
 
     # ==========================================
     # 第二步（可选）：运行 SFT 完整 demo

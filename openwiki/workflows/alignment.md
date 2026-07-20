@@ -5,7 +5,6 @@ description: Traces Parts 6–9 from response-only supervised fine-tuning throug
 tags: [alignment, sft, reward-model, ppo, grpo]
 resource: part_6/train_sft.py
 ---
-
 # Alignment workflows
 
 Parts 6–9 form a staged educational pipeline. They reuse the model and tokenizer produced by [Model and training architecture](../architecture/model-and-training.md), and each stage emits artifacts required by the next. Commands and concrete artifact locations live in [Testing and runs](../operations/testing-and-runs.md).

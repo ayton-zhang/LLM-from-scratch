@@ -5,7 +5,6 @@ description: Practical runbook for setting up the Python or Docker environment, 
 tags: [testing, operations, checkpoints, docker]
 resource: requirements.txt
 ---
-
 # Testing and runs
 
 This runbook executes and verifies the concepts in [Model and training architecture](../architecture/model-and-training.md) and the staged [Alignment workflows](../workflows/alignment.md). The repository has no root package configuration; local working directories are part of its runtime contract.
@@ -28,17 +27,17 @@ docker compose exec llm-lab bash
 
 Run commands from the indicated directory.
 
-| Part | Tests/checks | Demo behavior |
-|---|---|---|
-| 1 | `python orchestrator.py` | Add `--visualize` to write attention PNGs under `part_1/out/` |
-| 2 | `python orchestrator.py` | Always trains, samples, and evaluates; enables AMP and `torch.compile` |
-| 3 | `python orchestrator.py --skip-demo` | Omit `--skip-demo` to also generate 200 tokens with a window/sink configuration |
-| 4 | `python orchestrator.py --no-demo` | Omit `--no-demo` to train a small BPE model and sample from it |
-| 5 | `python orchestrator.py --no-demo` | Demo runs by default unless disabled |
-| 6 | `python orchestrator.py` | Add `--demo`; requires Part 4 artifacts |
-| 7 | `python orchestrator.py` | Add `--demo`; requires Part 4 tokenizer |
-| 8 | `python orchestrator.py` | Add `--demo`; requires Parts 4, 6, and 7 artifacts |
-| 9 | `python orchestrator.py` | Add `--demo`; requires Parts 4, 6, and 7 artifacts |
+| Part | Tests/checks                           | Demo behavior                                                                    |
+| ---- | -------------------------------------- | -------------------------------------------------------------------------------- |
+| 1    | `python orchestrator.py`             | Add`--visualize` to write attention PNGs under `part_1/out/`                 |
+| 2    | `python orchestrator.py`             | Always trains, samples, and evaluates; enables AMP and`torch.compile`          |
+| 3    | `python orchestrator.py --skip-demo` | Omit`--skip-demo` to also generate 200 tokens with a window/sink configuration |
+| 4    | `python orchestrator.py --no-demo`   | Omit`--no-demo` to train a small BPE model and sample from it                  |
+| 5    | `python orchestrator.py --no-demo`   | Demo runs by default unless disabled                                             |
+| 6    | `python orchestrator.py`             | Add`--demo`; requires Part 4 artifacts                                         |
+| 7    | `python orchestrator.py`             | Add`--demo`; requires Part 4 tokenizer                                         |
+| 8    | `python orchestrator.py`             | Add`--demo`; requires Parts 4, 6, and 7 artifacts                              |
+| 9    | `python orchestrator.py`             | Add`--demo`; requires Parts 4, 6, and 7 artifacts                              |
 
 For a single part's entire test directory:
 

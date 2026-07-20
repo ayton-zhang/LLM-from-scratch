@@ -5,7 +5,6 @@ description: Explains how Parts 1–5 evolve attention primitives into GPTModern
 tags: [architecture, transformer, pretraining, moe]
 resource: part_3/model_modern.py
 ---
-
 # Model and training architecture
 
 Parts 1–4 form a deliberate progression from transparent tensor math to a reusable modern language model and training stack. Part 5 explores MoE as a separate feed-forward replacement. The resulting `GPTModern` model and Part 4 assets are then reused by the [alignment workflows](../workflows/alignment.md), while their executable checks and artifact paths are catalogued in [Testing and runs](../operations/testing-and-runs.md).
