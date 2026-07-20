@@ -1,94 +1,95 @@
 ---
-type: Architecture Guide
-title: Model and Training Architecture
-description: Explains how Parts 1–5 evolve attention primitives into GPTModern, BPE-based training infrastructure, cached inference, and a standalone sparse Mixture-of-Experts feed-forward layer.
-tags: [architecture, transformer, pretraining, moe]
+type: 架构指南
+title: 模型与训练架构
+description: 说明 Parts 1–5 如何将 attention 原语演进为 GPTModern、基于 BPE 的训练基础设施、缓存推理，以及独立的稀疏 Mixture-of-Experts 前馈层。
 resource: part_3/model_modern.py
+tags: [架构, transformer, 预训练, moe]
 ---
-# Model and training architecture
 
-Parts 1–4 form a deliberate progression from transparent tensor math to a reusable modern language model and training stack. Part 5 explores MoE as a separate feed-forward replacement. The resulting `GPTModern` model and Part 4 assets are then reused by the [alignment workflows](../workflows/alignment.md), while their executable checks and artifact paths are catalogued in [Testing and runs](../operations/testing-and-runs.md).
+# 模型与训练架构
 
-## Part 1: make attention observable
+Parts 1–4 有意从可观察的张量数学逐步构建为可复用的现代语言模型和训练栈；Part 5 将 MoE 作为独立的前馈替换方案探索。形成的 `GPTModern` 和 Part 4 工件为[对齐工作流](../workflows/alignment.md)提供模型与 tokenizer，而其可执行检查和工件路径由[测试与运行](../operations/testing-and-runs.md)维护。
 
-Part 1 favors explicit operations over optimization. `part_1/multi_head.py` projects `(B,T,C)` into Q/K/V, reshapes them to `(B,H,T,D)`, applies scaled causal attention, merges heads, and returns both output and attention weights. `part_1/block.py` wraps attention and a 4× GELU FFN in pre-normalized residual connections.
+## Part 1：让 attention 可观察
 
-The NumPy demo, shape walkthrough, and optional heatmaps exist to make the matrix operations inspectable before training is introduced. This code is educational and standalone; later models reimplement the architecture rather than importing Part 1.
+Part 1 以显式操作而非优化为优先。`part_1/multi_head.py` 将 `(B,T,C)` 投影为 Q/K/V，重塑为 `(B,H,T,D)`，应用 scaled causal attention，合并 heads，并返回输出与 attention weights。`part_1/block.py` 以 pre-normalized 残差连接包裹 attention 和 4× GELU FFN。
 
-## Part 2: train the first causal LM
+NumPy demo、形状推演和可选 heatmap 的目的，是在引入训练之前让矩阵运算可检查。代码是独立教学实现；后续模型重新实现架构，并不 import Part 1。
 
-The first end-to-end flow is:
+## Part 2：训练第一个 causal LM
+
+首个端到端流程为：
 
 ```text
-UTF-8 file
+UTF-8 文件
   -> byte IDs (0..255)
-  -> 90/10 train/validation split
-  -> random x windows and one-token-shifted y windows
+  -> 90/10 训练/验证划分
+  -> 随机 x 窗口与右移一位的 y 窗口
   -> token + learned position embeddings
   -> pre-norm causal Transformer blocks
-  -> LM head and flattened cross-entropy
-  -> validation, checkpoint, autoregressive sampling
+  -> LM head 与展平 cross-entropy
+  -> 验证、checkpoint、autoregressive sampling
 ```
 
-The data shift is implemented in `part_2/dataset.py`; architecture and generation are in `part_2/model_gpt.py`; `part_2/train.py` owns AdamW, clipping, optional AMP/compile, periodic evaluation, and checkpoints. Generation crops context to `block_size` and recomputes the full window on every token, which motivates Part 3's cache.
+`part_2/dataset.py` 实现数据右移；`part_2/model_gpt.py` 包含架构和生成；`part_2/train.py` 管理 AdamW、clipping、可选 AMP/compile、定期评估和 checkpoint。生成会把上下文裁到 `block_size`，并在每个 token 上重算整段窗口，这正是 Part 3 cache 的动机。
 
-`model_best.pt` is the safest sampling artifact because it carries the model configuration used by `part_2/sample.py`. The final checkpoint format is less self-describing and may not reload a non-default architecture correctly.
+`model_best.pt` 是最稳妥的采样工件，因为它带有 `part_2/sample.py` 所需模型配置；最终 checkpoint 格式的信息较少，未必能正确重载非默认架构。
 
-## Part 3: modern model and cached inference
+## Part 3：现代模型与缓存推理
 
-`part_3/model_modern.py` removes learned positional embeddings and composes feature-selectable modern components:
+`part_3/model_modern.py` 移除 learned positional embeddings，并组合可选的现代组件：
 
-- `rmsnorm.py`: scale normalization without mean centering.
-- `rope_custom.py`: rotary position information applied to attention queries and keys.
-- `swiglu.py`: gated FFN activation.
-- `attn_modern.py`: causal attention with optional grouped-query attention, sliding windows, attention sinks, and K/V input/output.
-- `kv_cache.py`: cache containers plus a bounded `RollingKV` that retains the first `sink` and latest `window` positions.
+- `rmsnorm.py`：不做均值中心化的 scale normalization。
+- `rope_custom.py`：应用于 attention query/key 的 rotary 位置信息。
+- `swiglu.py`：门控 FFN activation。
+- `attn_modern.py`：支持 grouped-query attention、sliding windows、attention sinks 以及 K/V 输入输出的 causal attention。
+- `kv_cache.py`：cache 容器和有界 `RollingKV`；它保留最初 `sink` 与最新 `window` 个位置。
 
-Autoregressive generation performs one full prompt **prefill**, then passes one new token at each **decode** step while reusing prior K/V. This changes repeated attention setup from full-window recomputation to incremental reuse.
+autoregressive generation 先对完整 prompt 做一次 **prefill**，再在每个 **decode** 步仅传入一个新 token 并复用之前的 K/V；这使重复 attention 设置从完整窗口重算变为增量复用。
 
-### Cache caveat
+### Cache 注意事项
 
-The separately tested `RollingKV` enforces `length <= sink + window`, but `GPTModern.generate()` does not wire that object into its main cache path. `attn_modern.py` crops K/V for an attention computation, then creates the returned cache from the prior uncropped cache plus new K/V. Long-running generation can therefore keep growing the returned cache. In addition, using cache length as RoPE's next position is insufficient once old middle tokens are discarded; a production streaming design needs explicit absolute-position tracking. Treat the sliding-window demo as instructional, not a production memory guarantee.
+单独测试的 `RollingKV` 保证 `length <= sink + window`，但 `GPTModern.generate()` 没有将它接入主 cache 路径。`attn_modern.py` 会为一次 attention 计算裁剪 K/V，却用未裁剪的旧 cache 加新 K/V 来构造返回 cache；长时间生成仍可能让返回 cache 持续增长。此外，一旦丢弃中间旧 token，使用 cache length 作为 RoPE 下一位置并不充分；生产级 streaming 设计需要显式 absolute-position tracking。应将 sliding-window demo 视为教学示例，而不是生产内存上界保证。
 
-## Part 4: scale the training loop
+## Part 4：扩展训练循环
 
-`part_4/train.py` imports `GPTModern` from Part 3 and fixes RMSNorm, RoPE, and SwiGLU on for training. Its pipeline is:
+`part_4/train.py` 从 Part 3 import `GPTModern`，并在训练中固定启用 RMSNorm、RoPE 和 SwiGLU。其流程为：
 
 ```text
-text file -> train/load BPE -> tokenize corpus -> overlapping shifted windows
+文本文件 -> 训练/加载 BPE -> token 化语料 -> 重叠的右移窗口
 -> DataLoader -> GPTModern -> cross-entropy
--> AMP-scaled and/or accumulated gradients -> AdamW
+-> AMP-scaled 和/或 accumulated gradients -> AdamW
 -> warmup + cosine scheduler -> logger -> checkpoints
 ```
 
-The surrounding modules separate concerns:
+周边模块各自承担职责：
 
-- `tokenizer_bpe.py` trains and persists a Hugging Face BPE tokenizer.
-- `dataset_bpe.py` creates shifted training windows; despite “streaming” language, it reads and tokenizes the full file in memory.
-- `amp_accum.py` handles autocast/scaling and gradient accumulation.
-- `lr_scheduler.py` implements warmup plus cosine decay.
-- `checkpointing.py` saves model, optimizer, scheduler, scaler, step, and model configuration.
-- `logger.py` supports TensorBoard and optional WandB; WandB is dynamically imported but not pinned in `requirements.txt`.
+- `tokenizer_bpe.py`：训练并持久化 Hugging Face BPE tokenizer。
+- `dataset_bpe.py`：创建右移训练窗口；尽管名称带有 “streaming”，仍会在内存中读取并 token 化整个文件。
+- `amp_accum.py`：处理 autocast/scaling 与 gradient accumulation。
+- `lr_scheduler.py`：实现 warmup 加 cosine decay。
+- `checkpointing.py`：保存 model、optimizer、scheduler、scaler、step 和模型配置。
+- `logger.py`：支持 TensorBoard 和可选 WandB；WandB 动态 import，但未固定在 `requirements.txt`。
 
-Resume and downstream use depend on the original tokenizer path and compatible model/vocabulary dimensions. Moving a run directory can break its recorded tokenizer location. The training stop condition also follows `--steps`, while scheduler horizon derives from dataset/epoch calculations; unusual combinations can make those horizons diverge.
+resume 和下游使用依赖原 tokenizer 路径与兼容的 model/vocabulary dimensions。移动 run 目录可能破坏 checkpoint 所记录的 tokenizer 位置。训练停止取决于 `--steps`，scheduler horizon 则由 dataset/epoch 计算；非典型组合可使二者分歧。
 
-## Part 5: sparse experts as an FFN alternative
+## Part 5：作为 FFN 替代方案的稀疏 experts
 
-Part 5 is a standalone component study, not part of the Part 4–9 checkpoint chain. `part_5/gating.py` computes softmax expert probabilities and selects top-k experts for every token. `part_5/moe.py` dispatches tokens through independent MLPs with explicit Python loops and combines outputs using selected gate weights.
+Part 5 是独立组件学习，不属于 Part 4–9 checkpoint 链。`part_5/gating.py` 计算 softmax expert probabilities，并为每个 token 选取 top-k experts。`part_5/moe.py` 通过显式 Python loops 把 token 分发到独立 MLP，再用选中的 gate weights 合成输出。
 
-Important semantics:
+关键语义：
 
-- Selected top-k weights are not renormalized, so their sum can be below one.
-- The balancing term is `E * sum(importance * load)`, with soft-probability importance and top-1 assignment frequency.
-- There is no capacity factor, dropped-token policy, expert parallelism, or all-to-all communication.
-- `HybridFFN` in `block_hybrid.py` returns `alpha * Dense(x) + (1-alpha) * MoE(x)`, defaulting to `alpha=0.5`; both branches execute even at an endpoint value.
+- 选出的 top-k weights 不会重新归一化，因此其和可能小于一。
+- 平衡项是 `E * sum(importance * load)`，其中 importance 使用 soft probabilities，load 使用 top-1 assignment frequency。
+- 不含 capacity factor、dropped-token policy、expert parallelism 或 all-to-all communication。
+- `block_hybrid.py` 的 `HybridFFN` 返回 `alpha * Dense(x) + (1-alpha) * MoE(x)`，默认 `alpha=0.5`；即使端点值，两条分支仍都会执行。
 
-This implementation makes routing mechanics easy to inspect but should not be read as a performance-oriented MoE system. `part_5/README.md` explicitly frames production expert parallelism as outside scope.
+该实现让 routing mechanics 易于观察，但不应被解读为面向性能的 MoE 系统。`part_5/README.md` 明确将生产 expert parallelism 列为范围之外。
 
-## Change guidance
+## 变更指引
 
-- Attention changes should preserve `(B,H,T,D)` contracts and causal masking; run Part 1 and Part 3 tests.
-- Model configuration changes must propagate through checkpoint creation, loading, sampling, and every downstream stage.
-- Tokenizer changes affect Parts 4 and 6–9 together. Never compare or continue checkpoints with mismatched token IDs merely because vocabulary sizes match.
-- Cache work needs stronger tests than currently exist: compare cached and uncached logits/generation and exercise sequences longer than the configured window.
-- MoE changes should test routing gradients and per-expert utilization, not only output shapes and “some gradient exists.”
+- 修改 attention 时保持 `(B,H,T,D)` 契约和 causal masking；运行 Part 1 与 Part 3 测试。
+- 修改 model configuration 时，必须同步 checkpoint 创建、加载、采样和每个下游阶段。
+- tokenizer 改动会同时影响 Parts 4 与 6–9；即使 vocabulary size 相同，也不能把 token IDs 不一致的 checkpoint 混用。
+- cache 改动需要比现有测试更强的验证：比较 cached/uncached logits 与生成，并覆盖超过 configured window 的序列。
+- MoE 改动应测试 routing gradients 和每个 expert 的利用率，而非只测输出形状和“存在某些 gradient”。

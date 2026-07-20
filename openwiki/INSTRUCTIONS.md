@@ -1,1 +1,3 @@
 A code wiki for this local repository. Prioritize a concise quickstart, architecture overview, source map, key workflows, domain concepts, operations/runbook notes, testing guidance, and integration points. Inspect git history to understand reasoning behind code changes and the progression of the repository. Keep pages grounded in the repository structure and recent code changes. Prefer practical navigation for engineers over generic summaries.
+
+Write all titles, explanations, summaries, navigation text, and diagram labels in Simplified Chinese. Preserve code identifiers, API names, class and function names, file paths, commands, configuration keys, and established technical terms in their original English form.

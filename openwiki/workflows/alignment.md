@@ -1,13 +1,14 @@
 ---
-type: Workflow Guide
-title: Alignment Workflows
-description: Traces Parts 6–9 from response-only supervised fine-tuning through pairwise reward modeling to the repository's simplified PPO and GRPO training loops, including checkpoint dependencies and objective rules.
-tags: [alignment, sft, reward-model, ppo, grpo]
+type: 工作流指南
+title: 对齐工作流
+description: 跟踪 Parts 6–9 从仅监督回答的 SFT、成对 reward modeling 到简化 PPO 和 GRPO 训练循环的 checkpoint 依赖与目标规则。
 resource: part_6/train_sft.py
+tags: [对齐, sft, reward-model, ppo, grpo]
 ---
-# Alignment workflows
 
-Parts 6–9 form a staged educational pipeline. They reuse the model and tokenizer produced by [Model and training architecture](../architecture/model-and-training.md), and each stage emits artifacts required by the next. Commands and concrete artifact locations live in [Testing and runs](../operations/testing-and-runs.md).
+# 对齐工作流
+
+Parts 6–9 构成分阶段的教学管线。它们复用[模型与训练架构](../architecture/model-and-training.md)产生的模型和 tokenizer，并在各阶段产生下一阶段所需工件。命令与具体工件位置由[测试与运行](../operations/testing-and-runs.md)维护。
 
 ```text
 Part 4 pretrained GPTModern + BPE tokenizer
@@ -20,66 +21,68 @@ Part 7 reward-model checkpoint        frozen reference policy
                  |                            |
                  +------------+---------------+
                               v
-                    Part 8 PPO or Part 9 GRPO
+                    Part 8 PPO 或 Part 9 GRPO
 ```
 
-Part 5 MoE is not integrated into this chain.
+Part 5 MoE 不接入这条链。
 
-## Part 6: supervised fine-tuning
+## Part 6：supervised fine-tuning
 
-`part_6/dataset_sft.py` loads Alpaca-style instruction rows with a tiny fallback and exposes instruction/input/output fields. `formatters.py` converts them to a stable prompt and response template. `collator_sft.py` then:
+`part_6/dataset_sft.py` 加载 Alpaca-style instruction rows，并提供极小 fallback，暴露 instruction/input/output 字段。`formatters.py` 将它们转换为稳定的 prompt/response template。`collator_sft.py` 随后：
 
-1. tokenizes prompt and response;
-2. builds a causal sequence and next-token-shifted labels;
-3. masks prompt supervision with `-100`;
-4. pads input IDs with token ID `2` and labels with `-100`.
+1. token 化 prompt 和 response；
+2. 构造 causal sequence 与右移一位的 next-token labels；
+3. 用 `-100` 屏蔽 prompt supervision；
+4. 用 token ID `2` padding input IDs，并用 `-100` padding labels。
 
-The masking boundary intentionally leaves the label that predicts the first response token visible: it masks through `n_prompt - 1`, not the entire prompt-length prefix after shifting. This behavior came from a historical correction and is central to response-only training.
+masking boundary 有意保留“预测第一个 response token”的 label：右移之后，它只 mask 到 `n_prompt - 1`，而非整个 prompt-length prefix。这一历史修正是 response-only training 的核心。
 
-`train_sft.py` reuses `GPTModern` and can initialize from Part 4's pretrained checkpoint. The demo writes `part_6/runs/sft-demo/model_last.pt`; this becomes both the trainable starting policy and frozen reference for PPO/GRPO.
+`train_sft.py` 复用 `GPTModern`，可从 Part 4 pretrained checkpoint 初始化。demo 写入 `part_6/runs/sft-demo/model_last.pt`；它既是 trainable starting policy，也是 PPO/GRPO 的 frozen reference。
 
-## Part 7: pairwise reward model
+当前 `part_6/orchestrator.py` 默认会运行 demo，`--no-demo` 才跳过；其中 `test_formatter.py` 和 `test_masking.py` 的编排调用已被注释。因此，若需要实际单元测试，应从 `part_6/` 显式运行 `python -m pytest -q`，不要把 `python orchestrator.py` 视为测试入口。
 
-`part_7/data_prefs.py` loads chosen/rejected preference pairs (or two fallback examples). `collator_rm.py` formats and tokenizes each side using the SFT template. Unlike the causal LM, `model_reward.py` uses a bidirectional `TransformerEncoder`, masked mean pooling over non-padding tokens, and a scalar projection.
+## Part 7：成对 reward model
 
-Two losses are available in `loss_reward.py`:
+`part_7/data_prefs.py` 加载 chosen/rejected preference pairs（或两个 fallback examples）。`collator_rm.py` 使用 SFT template 格式化并 token 化每一侧。与 causal LM 不同，`model_reward.py` 使用 bidirectional `TransformerEncoder`、对 non-padding tokens 做 masked mean pooling，并接 scalar projection。
 
-- Bradley–Terry: `mean(softplus(-(r_chosen - r_rejected)))`.
-- Margin ranking: enforce `r_chosen >= r_rejected + margin`, with default margin `1.0`.
+`loss_reward.py` 提供两种 loss：
 
-`eval_rm.py` reports pairwise accuracy as the fraction where `r_chosen > r_rejected`. The demo's reward checkpoint at `part_7/runs/rm-demo/model_last.pt` supplies scalar rewards to both RL workflows.
+- Bradley–Terry：`mean(softplus(-(r_chosen - r_rejected)))`。
+- Margin ranking：要求 `r_chosen >= r_rejected + margin`，默认 margin 为 `1.0`。
 
-## Part 8: simplified PPO RLHF
+`eval_rm.py` 将 `r_chosen > r_rejected` 的比例报告为 pairwise accuracy。demo 的 `part_7/runs/rm-demo/model_last.pt` 为两条 RL 工作流提供 scalar rewards。
 
-`part_8/policy.py` wraps the SFT LM with a toy value head. `train_ppo.py` clones the SFT model into a trainable policy and frozen reference, generates one completion per prompt, scores formatted text with the reward model, and selects response-token log probabilities and values through utilities in `rollout.py`.
+## Part 8：简化 PPO RLHF
 
-The update rules are intentionally compact:
+`part_8/policy.py` 用 toy value head 包装 SFT LM。`train_ppo.py` 将 SFT model 克隆成 trainable policy 和 frozen reference：每个 prompt 生成一个 completion，用 reward model 对格式化文本评分，再借助 `rollout.py` 中的工具选择 response-token log probabilities 与 values。
 
-- probability ratio: `exp(new_logp - old_logp)`;
-- clipped PPO policy surrogate;
-- value loss: plain MSE;
-- sampled-token “entropy”: mean negative selected-token log probability;
-- total loss defaults to `policy + 0.5 * value - ent_coef * entropy`.
+更新规则经过刻意压缩：
 
-Reference divergence is applied as token reward shaping before advantages are computed. The scalar reward appears only at the terminal selected position; other response positions receive zero reward minus KL cost. Returns equal these immediate shaped rewards, and advantages are `returns - old_values` followed by normalization.
+- probability ratio：`exp(new_logp - old_logp)`；
+- clipped PPO policy surrogate；
+- value loss：普通 MSE；
+- sampled-token “entropy”：选中 token 的负 log probability 均值；
+- 默认 total loss：`policy + 0.5 * value - ent_coef * entropy`。
 
-Despite exposed `gamma` and `lambda` arguments, this loop does not implement discounted returns or GAE. It performs one update pass per fresh rollout. This is a teaching implementation of PPO mechanics, not a full RLHF trainer.
+reference divergence 会在计算 advantages 前作为 token reward shaping 加入。scalar reward 只放在最后一个 selected position；其他 response positions 只有零奖励减 KL cost。returns 等于这些 immediate shaped rewards，advantages 为 `returns - old_values` 再归一化。
 
-## Part 9: simplified GRPO
+尽管暴露 `gamma` 和 `lambda` 参数，该循环没有实现 discounted returns 或 GAE；每次 fresh rollout 只做一轮 update。因此这是讲解 PPO mechanics 的实现，不是完整 RLHF trainer。
 
-`part_9/train_grpo.py` generates `group_size` completions per prompt, scores each with the same reward model, subtracts the per-prompt group mean, and broadcasts that trajectory advantage to all response tokens. `grpo_loss.py` applies a PPO-style clipped policy objective plus an explicit reference term based on `mean(new_logp - ref_logp)`.
+## Part 9：简化 GRPO
 
-Unlike PPO, GRPO has no value loss. However, Part 9 still instantiates the copied `PolicyWithValue`; its value head is simply ignored. Advantages are normalized after token broadcasting, so longer responses contribute more entries to the flattened loss. The implementation also calls the reference-difference term “KL,” though it is a sampled log-probability difference rather than a full-distribution KL calculation.
+`part_9/train_grpo.py` 为每个 prompt 生成 `group_size` 个 completions，用同一 reward model 评分，减去每 prompt 的 group mean，并将 trajectory advantage 广播到所有 response tokens。`grpo_loss.py` 组合 PPO-style clipped policy objective 与基于 `mean(new_logp - ref_logp)` 的显式 reference term。
 
-## Cross-stage invariants and risks
+与 PPO 不同，GRPO 没有 value loss。但 Part 9 仍实例化复制的 `PolicyWithValue`；其 value head 被忽略。advantages 在 token broadcasting 后归一化，因此较长 response 会向展平 loss 提供更多条目。实现把 reference-difference term 称为 “KL”，但它是 sampled log-probability difference，而不是完整分布 KL。
 
-- **Tokenizer identity:** Parts 6–9 must use the same saved BPE tokenizer as the pretrained/SFT policy. Vocabulary-size equality is not enough.
-- **Model dimensions:** layer count, head count, embedding width, block size, and vocabulary must match the checkpoint; demos use a small `2/2/128` model tied to the Part 4 smoke run.
-- **Padding:** alignment collators and rollout batching assume padding ID `2`. Changing it requires checking masks and reward pooling.
-- **Sequence boundaries:** empty or truncated responses can invalidate terminal-reward indexing and masking assumptions.
-- **Reward-model contract:** the RM architecture/config loaded during RL must match its checkpoint and tokenizer.
-- **Evaluation limits:** `eval_ppo.py` is a small comparison script, duplicated into Part 9, and contains unused/copy-forward options; it is not a benchmark harness.
+## 跨阶段不变量与风险
 
-## Change guidance
+- **Tokenizer identity：**Parts 6–9 必须使用与 pretrained/SFT policy 同一份保存的 BPE tokenizer；仅 vocabulary-size 相等并不够。
+- **模型维度：**layer count、head count、embedding width、block size 和 vocabulary 必须匹配 checkpoint；demos 使用与 Part 4 smoke run 对应的小型 `2/2/128` 模型。
+- **Padding：**alignment collators 和 rollout batching 假定 padding ID 为 `2`；改动后须检查 masks 和 reward pooling。
+- **序列边界：**空或截断的 responses 会破坏 terminal-reward indexing 与 masking 假设。
+- **Reward-model contract：**RL 加载的 RM architecture/config 必须匹配其 checkpoint 与 tokenizer。
+- **评估边界：**`eval_ppo.py` 是小型比较脚本，复制到 Part 9，含未使用或 copy-forward options；不是 benchmark harness。
 
-When changing formatting or tokenization, add exact boundary assertions to `part_6/tests/test_masking.py` and run reward/RL tests because every later stage imports or reproduces those conventions. Objective changes should add numerical tests for clipping, masks, KL sign, group baselines, and gradient flow. End-to-end compatibility is currently not covered, so any checkpoint schema change should be smoke-tested through the next stage manually.
+## 变更指引
+
+改动 formatting 或 tokenization 时，在 `part_6/tests/test_masking.py` 增加精确 boundary assertions，并运行 reward/RL tests，因为每个后续阶段都 import 或重现这些约定。改动 objective 时，应增加 clipping、masks、KL sign、group baselines 和 gradient flow 的数值测试。当前没有端到端兼容性覆盖，所以任何 checkpoint schema 改动都应手动 smoke-test 到下一阶段。
