@@ -115,10 +115,10 @@ if __name__ == "__main__":
     # pytest -q（quiet 模式）减少输出噪音，只看关键结果。
 
     # test_formatter.py：验证 6.1 节的 prompt/response 模板是否正确格式化
-    # run("python -m pytest -q tests/test_formatter.py")
+    run("python -m pytest -q tests/test_formatter.py")
     # test_masking.py：验证 6.2 节的 causal LM label masking 是否正确
     #   （训练时 prompt 部分不计算 loss，只对 response 部分做监督）
-    # run("python -m pytest -q tests/test_masking.py")
+    run("python -m pytest -q tests/test_masking.py")
 
     # ==========================================
     # 第二步（可选）：运行 SFT 完整 demo

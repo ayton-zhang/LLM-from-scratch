@@ -275,8 +275,8 @@ class SFTCollator:
             # 为什么是 range(n_prompt-1) 而不是 range(n_prompt)？
             #   n_prompt 个 prompt token 占据了位置 0 到 n_prompt-1。
             #   但 y[t] 存的是 ids[t+1]（已经做过 shift 了），所以：
-            #     y[0]   = ids[1]  → 第 1 个 prompt token 预测第 2 个 prompt token
-            #     y[n_prompt-2] = ids[n_prompt-1] → 第 n_prompt-1 个 prompt token 预测第 n_prompt 个
+            #     y[0]   = ids[1]
+            #     y[n_prompt-2] = ids[n_prompt-1]
             #   位置 n_prompt-1 存的是 ids[n_prompt]，即 response 的第一个 token，
             #   它虽然在"prompt 区域索引"内，但预测内容是 response 的开头——我们希望保留这个。
             #   所以只屏蔽 0 到 n_prompt-2，保留 n_prompt-1 位置（它预测 response 开头）。

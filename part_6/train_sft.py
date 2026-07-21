@@ -254,7 +254,7 @@ def main():
         # 这比分开写 logits = model(xb); loss = F.cross_entropy(logits, yb) 更高效，
         # 因为模型内部可以复用 logits 的部分中间结果来计算 loss。
         # 返回值解包：
-        #   logits：输出概率分布，形状 (B, T+1, vocab_size)
+        #   logits：输出概率分布，形状 (B, T, vocab_size)
         #   loss：标量，平均交叉熵损失
         #   _：占位符，此处返回 None（Part 3 模型返回 kvs 用于推理，训练时不需要）
         logits, loss, _ = model(xb, yb)
