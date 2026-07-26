@@ -59,8 +59,9 @@ def run(cmd: str):
 if __name__ == "__main__":
     # 语法：argparse 模块用于构建标准命令行接口 (CLI)
     p = argparse.ArgumentParser()
-    # 添加可选参数 --demo：用户传入 --demo 时 args.demo 为 True，默认未传入时为 False
-    p.add_argument("--demo", action="store_true", help="tiny reward‑model demo")
+    # 默认 demo=True：方便直接运行完整 RM 流程，无需手动传 --demo。如需只跑测试，显式传入 --no-demo
+    p.add_argument("--demo", action="store_true", default=True, help="tiny reward‑model demo")
+    p.add_argument("--no-demo", action="store_false", dest="demo", help="skip the demo, run tests only")
     args = p.parse_args()
 
     # ─── 阶段 1：运行核心单元测试 ───
@@ -68,8 +69,8 @@ if __name__ == "__main__":
     run(f"{sys.executable} -m pytest -q tests/test_bt_loss.py")
     run(f"{sys.executable} -m pytest -q tests/test_reward_forward.py")
 
-    # ─── 阶段 2：可选流程——极小规模训练与效果验证 (Demo) ───
-    # 只有当用户显式传递 `--demo` 参数时才会触发（例如：python orchestrator.py --demo）
+    # ─── 阶段 2：极小规模训练与效果验证 (Demo) ───
+    # 默认开启 demo 验证（通过 args.demo 控制，可通过 --no-demo 关闭）
     if args.demo:
         # 1. 训练微型 RM：采用 2 层 Transformer 编码器、128 隐藏层维度、Bradley-Terry 损失，训练 300 步
         run(f"{sys.executable} train_rm.py --steps 300 --batch_size 8 --block_size 256 --n_layer 2 --n_head 2 --n_embd 128 --loss bt --bpe_dir ../part_4/runs/part4-demo/tokenizer")

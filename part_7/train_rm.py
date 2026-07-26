@@ -53,6 +53,9 @@ def main():
                         n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd).to(device)
 
     # 初始化 AdamW 优化器（适用于 Transformer 的权重衰减修正优化器）
+    # 语法/原理：betas=(beta1, beta2) 分别控制梯度的：
+    #   - beta1 (0.9)  : 一阶矩衰减率（动量 Momentum，平滑梯度方向，保留 90% 历史方向惯性）
+    #   - beta2 (0.999): 二阶矩衰减率（方差 Variance，自适应调节各参数学习率，以 99.9% 比例平滑梯度平方幅度）
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999))
 
     # train (tiny)
