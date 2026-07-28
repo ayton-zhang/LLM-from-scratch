@@ -66,7 +66,10 @@ def run(cmd: str):
     print(f"\n>>> {cmd}")
     # shlex.split：按 shell 语法拆分命令字符串，正确处理引号和转义。
     # cwd=ROOT：工作目录设为 part_4/，确保 import 路径正确。
-    res = subprocess.run(shlex.split(cmd), cwd=ROOT)
+    args = shlex.split(cmd)
+    if args and args[0] in ("python", "python3"):
+        args[0] = sys.executable
+    res = subprocess.run(args, cwd=ROOT)
     # sys.exit(n)：透传子进程退出码。n=0 正常，n≠0 异常。
     # 这样外部 CI/脚本能正确判断成功或失败。
     if res.returncode != 0:

@@ -82,7 +82,7 @@ def run(cmd: str):
     args = shlex.split(cmd)
     # 将 "python" 替换为 sys.executable（当前 Python 解释器的绝对路径），
     # 避免 bare "python" 在 PATH 中找不到的问题（如 venv、conda 环境）。
-    if args and args[0] == "python":
+    if args and args[0] in ("python", "python3"):
         args[0] = sys.executable
     res = subprocess.run(args, cwd=ROOT)
 

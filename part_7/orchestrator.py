@@ -44,7 +44,10 @@ def run(cmd: str):
     # 例如把 "python train_rm.py --steps 300" 拆分为 ['python', 'train_rm.py', '--steps', '300']
     # 相比字符串直接 .split(' ')，shlex 能妥善处理被双引号包围的单参数等复杂情况。
     # 语法：cwd=ROOT 设定子进程的工作目录为 part_7/，保证脚本引用的相对路径保持一致。
-    res = subprocess.run(shlex.split(cmd), cwd=ROOT)
+    args = shlex.split(cmd)
+    if args and args[0] in ("python", "python3"):
+        args[0] = sys.executable
+    res = subprocess.run(args, cwd=ROOT)
 
     # 检查子进程退出码（returncode）:
     # returncode == 0 表示成功执行；非 0 表示发生错误或测试失败（例如 pytest 判定未通过）。

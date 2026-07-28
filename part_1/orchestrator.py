@@ -33,7 +33,10 @@ OUT = ROOT / "out"
 
 def run(cmd: str):
     print(f"\n>>> {cmd}")
-    res = subprocess.run(shlex.split(cmd), cwd=ROOT)
+    args = shlex.split(cmd)
+    if args and args[0] in ("python", "python3"):
+        args[0] = sys.executable
+    res = subprocess.run(args, cwd=ROOT)
     if res.returncode != 0:
         sys.exit(res.returncode)
 

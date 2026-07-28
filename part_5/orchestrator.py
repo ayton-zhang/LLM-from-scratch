@@ -59,18 +59,20 @@ def run(cmd: str):
     #   不同系统（Linux/macOS/Windows）和不同环境（系统 Python/conda/venv）中，
     #   可执行文件可能叫 python、python3、python3.10 等，直接写死 "python"
     #   会导致 FileNotFoundError。用 sys.executable 保证找到的一定是同一个解释器。
-    cmd = cmd.replace("python", sys.executable, 1)
-
     # 打印命令，方便用户看到当前正在执行哪一步
     print(f"\n>>> {cmd}")
 
     # 语法：shlex.split(cmd)
     #   把命令字符串拆成列表，例如 "python -m pytest -q" → ["python", "-m", "pytest", "-q"]
     #   比手写 .split() 更安全：它正确处理引号包裹的参数（如 "test name with spaces"）
+    args = shlex.split(cmd)
+    if args and args[0] in ("python", "python3"):
+        args[0] = sys.executable
+
     # 语法：subprocess.run(args, cwd=ROOT)
     #   cwd 参数指定子进程的工作目录——无论脚本从哪里被调用，命令都在 part_5/ 下执行
     #   subprocess.run 会阻塞等待子进程结束，返回一个 CompletedProcess 对象
-    res = subprocess.run(shlex.split(cmd), cwd=ROOT)
+    res = subprocess.run(args, cwd=ROOT)
 
     # 语法：res.returncode
     #   子进程的退出码，0 = 成功，非 0 = 失败

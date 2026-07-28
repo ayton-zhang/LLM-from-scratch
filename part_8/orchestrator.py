@@ -28,7 +28,7 @@
 # pathlib     → 面向对象的路径操作，精确定位当前脚本所在目录
 # subprocess  → 在 Python 中创建子进程执行外部命令（如 pytest、train_ppo.py）
 # sys         → 用于在子进程异常退出时及时终止调度器
-import argparse, pathlib, subprocess, sys
+import argparse, pathlib, shlex, subprocess, sys
 
 # ─── 路径定位 ───
 # 语法：pathlib.Path(__file__).resolve().parent
@@ -43,8 +43,11 @@ def run(cmd: str):
     # 打印即将执行的命令提示，方便定位调试
     print(f"\n>>> {cmd}")
 
-    # 语法：cmd.split() 按空格拆分命令字符串为参数列表；cwd=ROOT 设定工作目录为 part_8/
-    res = subprocess.run(cmd.split(), cwd=ROOT)
+    # 语法：shlex.split(cmd) 按 shell 语法拆分命令字符串；如果以 python 开头则使用 sys.executable
+    args = shlex.split(cmd)
+    if args and args[0] in ("python", "python3"):
+        args[0] = sys.executable
+    res = subprocess.run(args, cwd=ROOT)
 
     # 语法：res.returncode 非 0 表示子进程执行报错（如单元测试未通过），此时立即退出，防止错误隐蔽扩散
     if res.returncode != 0:

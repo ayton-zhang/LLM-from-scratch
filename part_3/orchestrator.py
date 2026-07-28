@@ -78,7 +78,10 @@ def run(cmd: str):
     # 为什么不用硬编码的 "python"？子进程的 PATH 环境变量可能与当前终端不同
     # （如 virtualenv 或 IDE 内置终端），PATH 中可能没有 python。
     # sys.executable 始终指向正确解释器，避免 "python: command not found"。
-    res = subprocess.run(shlex.split(cmd), cwd=ROOT)
+    args = shlex.split(cmd)
+    if args and args[0] in ("python", "python3"):
+        args[0] = sys.executable
+    res = subprocess.run(args, cwd=ROOT)
 
     # sys.exit(n)：以退出码 n 终止整个 Python 进程。
     # n=0 表示正常退出，n≠0 表示异常退出。这里把子进程的退出码透传出去，
