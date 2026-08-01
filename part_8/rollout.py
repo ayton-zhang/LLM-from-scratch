@@ -193,17 +193,12 @@ def gather_logprobs(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     # ─── 步骤 1：Logits → Log-Probabilities ───
     # 类比：logits 是每位考生的"卷面原始分"，log_softmax 把原始分归一化为"对数概率"——
     #       分数最高的考生概率最大，但所有考生概率之和 = 1（在概率空间），取 log 后求和 ≠ 1。
-    # 语法：torch.log_softmax(logits, dim=-1) 在词表维度（最后一维）上计算 log(softmax(x))。
-    #       为什么不先算 softmax 再取 log？因为 softmax 涉及 exp() 运算，当某个 logit 很大时
-    #       exp(大数) 会溢出为 inf，导致数值不稳定。log_softmax 在实现上做了"减最大值"的
-    #       数值技巧（log-sum-exp trick），同时完成 softmax 和 log，一步到位且数值稳定。
     logp = torch.log_softmax(logits, dim=-1)  # 形状: (B, T, V) —— 每个位置、每个候选词的对数概率
 
     # ─── 步骤 2：从 V 个候选词中精确提取 labels 指定的那个 Token 的对数概率 ───
     # 语法拆解（三步走）：
     #   ① labels.unsqueeze(-1)：将 labels 从 (B, T) 扩展为 (B, T, 1)，
     #      新增的最后一维用于匹配 logp 的第三维（V 维），作为 gather 操作的"索引维"。
-    #      类比：从一排 V 个抽屉中取出特定编号抽屉里的东西，需要告诉 gather "你要第几号抽屉"。
     #   ② logp.gather(-1, ...)：在 dim=-1（词表维）上，按照 labels 中的 Token ID 收集对应的对数概率。
     #      输出形状为 (B, T, 1) —— 最后一个维度被压缩为 1（只取了一个抽屉）。
     #   ③ .squeeze(-1)：将最后一维的 1 挤掉，恢复为 (B, T)。

@@ -294,13 +294,36 @@ def main():
         max_len = min(policy_ctx, max(t[0].numel() for t in data))
         B = len(data)  # 批次大小
 
-        # 预分配四个张量缓存，一次性分配整块 GPU 显存比循环中逐个 .cat() 拼凑更高效：
+        # ─── 预分配四个张量缓存：把变长序列"矩形化"成规整批次 ───
+        # 为什么必须预分配？
+        #   1. 批处理硬性要求：PyTorch 一次前向只能吃规整矩形 (B, max_len)，
+        #      但批次内每条序列长度不同，必须统一到 max_len 再送入模型。
+        #   2. 效率：torch.zeros 一次性分配整块显存，循环里只需"按位置填格子"；
+        #      若改用循环中逐个 .cat() 拼凑，每次都要重新分配内存 + 拷贝，
+        #      时间开销 O(B×L)，还会造成显存碎片。
+        #   类比：预分配 = 一张固定大小的画布上按坐标作画；cat = 画一张纸再粘一张。
+        # 为什么初始化为全 0？
+        #   对每个张量而言，"全 0"恰好是"此处无内容"的语义默认值：
+        #   未填的位置、未标记的位置、未收到奖励的位置，都天然有正确含义。
         seq     = torch.zeros(B, max_len, dtype=torch.long, device=device)       # Token 序列张量, 形状 (B, max_len)
+        #   ① seq：整个 batch 对齐后的完整 token 序列（prompt + response）的"画布"。
+        #      0 是初始占位值（token ID 0），随后所有位置都会被显式覆盖或 padding。
         mask    = torch.zeros(B, max_len, dtype=torch.bool, device=device)      # Response 动作掩码, 形状 (B, max_len)
-        # 补充：mask[b, t] = True 表示位置 t 的 token 是"模型自己生成的 response 部分"，
-        #   只有这些位置的 token 才参与 PPO 损失计算；prompt 部分不参与（不是策略的动作）。
+        #   ② mask：动作掩码——标记哪些 token 是"模型自己生成的 response 部分"。
+        #      mask[b, t] = True 表示位置 t 是策略的动作；False = prompt（环境给定，不是策略的选择）。
+        #      只有 True 的位置才参与 PPO 损失计算，prompt 部分绝不参与（否则模型会去"学习"输入本身）。
         last_idx = torch.zeros(B, dtype=torch.long, device=device)              # 每条序列末尾索引, 形状 (B,)
+        #   ③ last_idx：每条序列最后一个有效 token 的索引（L-1），即"序列在哪结束"。
+        #      形状 (B,) 而非 (B, max_len)——每条序列只需要一个数字。
+        #      注：当前版本该张量只写不读，为将来扩展预留（如完整 GAE 的时序差分递推、
+        #      长度掩码都需要知道序列真实结束位置）。不影响现有训练正确性。
         rewards  = torch.zeros(B, max_len, dtype=torch.float, device=device)    # 稀疏奖励张量（仅序列结尾有值）, 形状 (B, max_len)
+        #   ④ rewards：稀疏奖励张量——把每条样本的"一个"标量 RM 奖励，
+        #      安放到该序列最后一个有效 token 的位置 rewards[i, L-1] = r_scalar。
+        #      为什么必须摊进 (B, max_len) 而非存 (B,)？因为阶段 D 的 KL 惩罚是逐 token 的：
+        #      shaped_r = rewards[:, 1:][act_mask] - kl_coef * kl，需要每个 token 位置都有
+        #      一个奖励值才能与 logprobs 逐位置相减。标量奖励必须"落位"到矩阵里才能参与逐位置运算。
+        #      初始全 0 = 该位置未收到奖励（prompt 位置和 response 中间位置天然无奖励）。
 
         for i, (ids, boundary, r_scalar) in enumerate(data):
             L_full = ids.numel()                    # 原始序列的真实长度（可能超过 max_len）
