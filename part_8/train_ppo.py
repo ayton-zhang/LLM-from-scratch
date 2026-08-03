@@ -15,10 +15,10 @@
 #   F. 监控日志：记录 KL 偏移量和 loss 指标
 #
 # 与标准 RLHF 的区别（本教程的简化点）：
-#   1. 优势估计使用”即时奖励 - Value”的简化近似，而非完整的 GAE 时序差分展开
-#      （完整 GAE 需要从序列末尾反向递推，代码量更大但对教学不友好）
-#   2. 奖励为稀疏奖励（仅序列末尾有标量值），而非每个 token 都有稠密奖励
-#   3. 批次大小很小（默认 4），适合单卡调试和教学演示
+#   1. 批次大小很小（默认 4），适合单卡调试和教学演示
+#   2. RM 奖励为稀疏奖励（仅序列末尾有标量值），但 KL 惩罚提供了逐 token 的稠密信号
+#   3. 优势估计使用完整的 GAE 时序差分展开（从序列末尾反向递推累积未来奖励，
+#      --gamma 管”多远”、--lam 管”多信”），与 InstructGPT 的标准做法一致
 # ==========================================
 
 from __future__ import annotations
@@ -315,14 +315,13 @@ def main():
         last_idx = torch.zeros(B, dtype=torch.long, device=device)              # 每条序列末尾索引, 形状 (B,)
         #   ③ last_idx：每条序列最后一个有效 token 的索引（L-1），即"序列在哪结束"。
         #      形状 (B,) 而非 (B, max_len)——每条序列只需要一个数字。
-        #      注：当前版本该张量只写不读，为将来扩展预留（如完整 GAE 的时序差分递推、
-        #      长度掩码都需要知道序列真实结束位置）。不影响现有训练正确性。
+        #      GAE 会用它识别每条轨迹的终止 action，避免把右侧 padding 当成未来状态。
         rewards  = torch.zeros(B, max_len, dtype=torch.float, device=device)    # 稀疏奖励张量（仅序列结尾有值）, 形状 (B, max_len)
         #   ④ rewards：稀疏奖励张量——把每条样本的"一个"标量 RM 奖励，
         #      安放到该序列最后一个有效 token 的位置 rewards[i, L-1] = r_scalar。
-        #      为什么必须摊进 (B, max_len) 而非存 (B,)？因为阶段 D 的 KL 惩罚是逐 token 的：
-        #      shaped_r = rewards[:, 1:][act_mask] - kl_coef * kl，需要每个 token 位置都有
-        #      一个奖励值才能与 logprobs 逐位置相减。标量奖励必须"落位"到矩阵里才能参与逐位置运算。
+        #      为什么必须摊进 (B, max_len) 而非存 (B,)？因为阶段 D 的即时奖励需要和
+        #      logprobs/values 保持逐时间步对齐，之后再用 act_mask 只保留 response action。
+        #      标量奖励必须"落位"到矩阵里才能参与逐位置的 GAE 递推。
         #      初始全 0 = 该位置未收到奖励（prompt 位置和 response 中间位置天然无奖励）。
 
         for i, (ids, boundary, r_scalar) in enumerate(data):
@@ -380,7 +379,7 @@ def main():
         #   为了对齐，mask 的第 1~T-1 列（即 mask[:, 1:]）正好对应"预测位置 1~(T-1) 的 token"。
         #   也就是说，mask[0] 对应 token_0 但 logprobs 第 0 个预测的是 token_1，所以要用 mask[1:]。
         #   更直观的理解：token_0（通常是 <s>）从来不被任何位置预测，所以 mask 的第 0 列需要排除。
-        act_mask = mask[:,1:]  # 形状: (B, T-1)，True 的位置 = "该预测对应的是 response token"
+        act_mask = mask[:,1:]  # 形状: (B, T-1)，True 的位置 = "被预测的是否是response token"
         # 布尔索引筛选：act_mask 为 True 的位置被拉平为一维向量
         # .detach() 切断梯度——旧策略的概率在 PPO 更新中作为常数基准，不应回传梯度
         old_logp   = pol_lp[act_mask].detach()    # 形状: (N_action_tokens,)
@@ -388,55 +387,108 @@ def main():
         old_values = values[act_mask].detach()    # 形状: (N_action_tokens,)
 
         # ==========================================
-        # 阶段 D：KL 惩罚、塑造奖励 (Shaped Rewards) 与优势函数 (Advantage) 计算
+        # 阶段 D：KL 惩罚、逐 token 即时奖励与 GAE 优势函数计算
         # ==========================================
-        # 这是 RLHF 的"奖励塑造"(Reward Shaping) 核心步骤，分三步走：
+        # 这是 RLHF 的"奖励塑造 + 优势估计"核心步骤（InstructGPT 的标准做法），分三步走：
         #
-        # 1. 计算每个动作 token 的 KL 散度近似值
-        #    KL 散度衡量两个概率分布之间的"距离"——分布越接近，KL 越接近 0。
-        #    公式：KL(π_old || π_ref) ≈ E_{a~π_old}[log π_old(a|s) - log π_ref(a|s)]
-        #    这里用单样本近似：KL ≈ log π_old(a|s) - log π_ref(a|s)，其中 a 是实际采样的 token。
-        #    每个 token 是独立的离散动作，所以直接逐元素相减即可。
+        # 1. 计算逐 token KL 散度（保持二维序列结构，供 GAE 使用）
+        # 2. 构造逐 token 即时奖励：每个 token = −kl_coef·KL，末尾额外 + RM 分
+        # 3. GAE 反向递推：把未来的奖励按 γλ 衰减往回传，算出每个 token 的优势
         #
-        #    注意：此处的 KL 是基于"每个采样的 token 动作"计算的近似值。
-        #    严格来说 KL 需要对整个词表求和，但那只在"需要完整的分布距离"时才必要，
-        #    在 PPO 中，用采样的 token 估计 KL 计算量小、效果足够好（InstructGPT 的做法）。
-        kl = (old_logp - ref_logp)  # 形状: (N_action_tokens,)
+        # ─── 1. 计算逐 token 的 KL 散度（二维，保持序列结构）───
+        # KL 散度衡量两个概率分布之间的"距离"——分布越接近，KL 越接近 0。
+        # 公式：KL(π_old || π_ref) ≈ E_{a~π_old}[log π_old(a|s) - log π_ref(a|s)]
+        # 单样本近似：KL ≈ log π_old(a|s) - log π_ref(a|s)，每个 token 是独立离散动作，逐元素相减即可。
+        # 形状 (B, T-1)：每个预测位置一个 KL 值（含 prompt 位置，稍后会被 act_mask 过滤）。
+        # 注意：严格来说 KL 需要对整个词表求和，但那只在"需要完整分布距离"时才必要，
+        #       PPO 中采样估计计算量小、效果足够好（InstructGPT 的做法）。
+        kl_full = pol_lp - ref_lp  # 形状: (B, T-1) 逐 token KL（旧策略 vs 参考模型）
 
-        # 2. 塑造奖励 (Shaped Reward)：在原始 RM 标量奖励的基础上，减去 KL 惩罚项
-        #    核心思想：Reward Model 只看最终回答好坏，不关心语言是否自然流畅。
-        #    如果不加 KL 惩罚，Policy 会"走火入魔"——生成一堆语法错乱但 RM 喜欢的高分词。
-        #    加了 KL 惩罚后，每偏离一次 reference，就扣一次分，迫使模型保持自然的语言风格。
+        # ─── 2. 构造逐 token 即时奖励序列 r_t ───
+        # 标准 RLHF 的奖励结构：
+        #   每个 token 的即时奖励 = −kl_coef·KL(π‖π_ref)   （"别跑偏"的稠密惩罚）
+        #   最后一个 token 额外 + RM 分                      （"人类偏好"的稀疏信号）
+        # 为什么 KL 惩罚要进奖励？Reward Model 只看回答好坏，不关心语言是否自然流畅；
+        # 若不惩罚偏离，Policy 会"走火入魔"——生成一堆语法错乱但 RM 喜欢的高分词。
         #
-        #    语法：rewards[:, 1:] 取 rewards 张量的第 1 列到最后一列（形状 B, T-1），
-        #    与 act_mask 对齐（logprobs 对应的是预测时刻，形状为 B, T-1）。
-        #    [act_mask] 布尔索引提取出 response 位置的奖励值。
-        shaped_r = rewards[:,1:][act_mask] - args.kl_coef * kl  # 形状: (N_action_tokens,)
+        # 语法：rewards[:, 1:] 把 (B, T) 的稀疏 RM 分对齐到预测时刻轴 (B, T-1)：
+        #   预测时刻 t 拿到的奖励 = 被预测 token (t+1) 位置上的奖励。
+        # 只保留 response action 的奖励；prompt 和右侧 padding 不是 rollout transition，
+        # 不能让它们的 KL/value 信号进入 GAE。
+        shaped_full = rewards[:, 1:] - args.kl_coef * kl_full
+        r_t = torch.where(act_mask, shaped_full, torch.zeros_like(shaped_full))
 
-        # 3. 优势函数 (Advantage) 与目标回报 (Returns) 估计
-        #    优势函数 A(s,a) 回答的问题是："在当前状态 s 下做了动作 a，比预期的好多少？"
-        #    A > 0 → 这个动作比预期好，增大它的概率
-        #    A < 0 → 这个动作比预期差，减小它的概率
-        #    A ≈ 0 → 中规中矩，不调整
+        # ==========================================
+        # 阶段 D-2：完整版 GAE 优势估计 (Generalized Advantage Estimation)
+        # ==========================================
+        # 为什么要 GAE？——让"远见"往回传。
+        #   如果只看即时奖励（γ=0 的单步近视），中间的 token 学不到
+        #   "末尾 RM 高分"的信息；GAE 从序列末尾反向递推，
+        #   把未来的奖励按指数衰减往回传，每个 token 都能"闻到"最终得分的味道。
         #
-        #    教程简化版：将 shaped_r 直接作为 returns（目标回报），adv = returns - values。
-        #    完整的 GAE 算法需要从序列末尾反向递推，累积未来奖励的加权和（用 gamma 和 lambda 参数）。
-        #    这里的简化等价于：假设 gamma=0（只看即时奖励，不考虑未来）。
-        #    对于 token 级别的生成任务，即时 KL 惩罚已经提供了逐 token 的稠密信号，
-        #    所以即使不做完整 GAE 递推，训练也能正常进行。
-        returns = shaped_r                     # 形状: (N_action_tokens,)
-        adv = returns - old_values             # 形状: (N_action_tokens,)，优势 = 实际奖励 - 预测价值
+        # 数学核心（两步）：
+        #   ① 时序差分误差（"惊喜度"）：δ_t = r_t + γ·V(s_{t+1}) − V(s_t)
+        #      实际拿到的（当前奖励 + 未来预估）比我原本预测的价值好多少
+        #   ② GAE 累积（"带遗忘的惊喜累积器"）：A_t = δ_t + γλ·A_{t+1}
+        #      从序列末尾往前滚，未来每步的惊喜按 (γλ) 指数衰减累加
+        #
+        # 参数直觉：
+        #   γ（gamma）：未来奖励的折扣因子——多久远的奖励还算数（0 = 只看当下）
+        #   λ（lam）  ：偏差-方差折中——λ=0 只看一步（低方差高偏差，太信价值网络）；
+        #               λ=1 看完整条轨迹（无偏高方差，太信单次采样）；0.95 是工业默认折中
+        #
+        # 维度说明（都在"预测时刻轴"上，形状 (B, T-1)）：
+        #   values[b, t] = 看到 token_0..t 后的状态价值（阶段 C 已对齐好）
+        #   r_t[b, t]    = 预测时刻 t 的即时奖励（上面第 2 步算好）
+        #   递推只覆盖 response action；每条样本自己的最后一个 action 之后没有未来，
+        #   padding 和 prompt 位置都会重置递推状态。
+        with torch.no_grad():
+            T1 = values.size(1)              # 预测时刻轴长度 = T-1
+            adv_full = torch.zeros_like(values)      # (B, T-1) 每个预测时刻的优势
+            returns_full = torch.zeros_like(values)  # (B, T-1) 价值头的回归目标
+            # values[:, t] 是 action t 的当前状态价值，action t 预测 token t+1。
+            # 因此 last_idx（最后一个 token 的位置）对应的最后一个 action 是 last_idx - 1。
+            time = torch.arange(T1, device=device).unsqueeze(0)  # (1, T-1)
+            nonterminal = (time + 1) < last_idx.unsqueeze(1)      #当前 action 执行后，是否还有下一个状态的 value (B, T-1)
+            # action t 的下一个状态价值；最后一个时间步没有可用的 next value。
+            next_values = torch.cat(
+                [values[:, 1:], values.new_zeros((B, 1))], dim=1
+            )
+            # 初始 A_next = 0：从每条轨迹的终点开始反向递推。
+            A_next = values.new_zeros(B)
+            for t in range(T1 - 1, -1, -1):   # t 从最后一个预测时刻倒着滚到 0
+                # 为什么从后往前？因为 A_t 依赖 A_{t+1}（未来的惊喜），
+                # 必须先把后面的算出来才能算前面的——就像搭积木从顶层往下搭。
+                # 每条样本在自己的终止 action 处不 bootstrap；padding 位置也不 bootstrap。
+                next_v = torch.where(
+                    nonterminal[:, t], next_values[:, t], torch.zeros_like(next_values[:, t])
+                )
+                # ① 惊喜度：δ_t = 实际拿到的（奖励 + 未来预估）− 我原本预测的价值
+                delta = r_t[:, t] + args.gamma * next_v - values[:, t]
+                # ② 关键递推：A_t = δ_t + γλ·A_{t+1}
+                #    未来每步的惊喜按 γλ 衰减累积——λ 越大"看得越远"
+                candidate = delta + args.gamma * args.lam * nonterminal[:, t] * A_next
+                # 只有 response action 是有效 transition；处理 padding/prompt 时清零，
+                # 防止无效位置的信号泄漏到前面的 response。
+                A_next = torch.where(act_mask[:, t], candidate, torch.zeros_like(candidate))
+                adv_full[:, t] = A_next
+                # 价值头回归目标：returns_t = A_t + V(s_t)
+                # （价值头要学的不是"惊喜"而是"完整回报"，所以把基线加回去）
+                returns_t = A_next + values[:, t]
+                returns_full[:, t] = torch.where(
+                    act_mask[:, t], returns_t, torch.zeros_like(returns_t)
+                )
 
-        # 优势归一化：对整批动作的优势做 Z-Score 归一化（零均值 + 单位方差）
-        # 为什么需要归一化？PPO 的 clip 范围（默认 ±0.2）是固定值。
-        #   如果原始优势的数值范围变化很大（有时 ±0.01，有时 ±100），
-        #   clip 的效果就无法保持一致——有时太松、有时太紧。
-        #   归一化后优势永远在相近的数量级，clip 参数可以稳定发挥作用。
-        #
-        # 语法：(adv - adv.mean()) / (adv.std().clamp_min(1e-6))
-        #   .mean() 和 .std() 对一维张量求均值和标准差，返回标量。
-        #   .clamp_min(1e-6) 将 std 下限钳制为 1e-6，防止所有优势完全相同（std=0）时除零报错。
-        adv = (adv - adv.mean()) / (adv.std().clamp_min(1e-6))
+        # ─── 3. 提取动作位置并归一化 ───
+        # act_mask 布尔索引展平 → 只留 response 预测位置（"漏网之鱼倒进一个筐"）
+        # .detach()：GAE 算出的优势是采样时刻的常数基准，不该参与反向传播
+        adv_final = adv_full[act_mask].detach()          # 形状: (N_action_tokens,)
+        returns_final = returns_full[act_mask].detach()  # 形状: (N_action_tokens,)
+        # Z-Score 归一化（零均值 + 单位方差）：PPO 的 clip 范围（默认 ±0.2）是固定值，
+        # 优势尺度不归一化时 clip 效果不稳定（有时太松、有时太紧）。
+        # 使用 unbiased=False，使只有一个 action token 时 std 仍返回 0 而不是 nan。
+        adv_std = adv_final.std(unbiased=False).clamp_min(1e-6)
+        adv_final = (adv_final - adv_final.mean()) / adv_std
 
         # ==========================================
         # 阶段 E：PPO 损失计算与梯度更新 (PPO Update Pass)
@@ -483,15 +535,15 @@ def main():
         # 调用 ppo_losses 核心算法计算三项损失
         # 参数说明：
         #   new_logp, old_logp: 新旧策略的对数概率，用于计算重要性比率 ratio = exp(new - old)
-        #   adv: 优势函数，正值→增大概率，负值→减小概率
+        #   adv_final: GAE 计算出的优势函数（已归一化），正值→增大概率，负值→减小概率
         #   new_values, old_values: 新旧价值估计（old_values 用于计算 value clipping）
-        #   returns: 目标回报（shaped_r），Value Head 的回归目标
+        #   returns_final: 目标回报（GAE 的 A_t + V(s_t)），Value Head 的回归目标
         #   clip_ratio=0.2: PPO 的核心参数——限制策略更新幅度不超过 ±20%
         #     如果 ratio ∈ [0.8, 1.2]，直接优化；超出范围则用 clip 截断梯度
         #   vf_coef=0.5: Value Function 损失在总损失中的权重系数
         #   ent_coef=0.0: 熵奖励系数（此处关闭，如需鼓励更多探索可设为正值）
         from ppo_loss import ppo_losses
-        out_loss = ppo_losses(new_logp, old_logp, adv, new_values, old_values, returns,
+        out_loss = ppo_losses(new_logp, old_logp, adv_final, new_values, old_values, returns_final,
                               clip_ratio=0.2, vf_coef=0.5, ent_coef=0.0)
         # out_loss 是具名元组，包含 .policy_loss, .value_loss, .entropy_loss, .total_loss
         loss = out_loss.total_loss
