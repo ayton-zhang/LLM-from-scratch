@@ -324,23 +324,37 @@ def main():
         #      标量奖励必须"落位"到矩阵里才能参与逐位置的 GAE 递推。
         #      初始全 0 = 该位置未收到奖励（prompt 位置和 response 中间位置天然无奖励）。
 
+        # data 中每一项都是 (完整 token 序列, 原始 prompt 边界, RM 标量奖励)。
+        # 下面的循环把每条变长样本放进同一张 (B, max_len) 的"矩形画布"，
+        # 同时重新计算截断后的 response 边界、动作 mask 和终点位置。
         for i, (ids, boundary, r_scalar) in enumerate(data):
-            L_full = ids.numel()                    # 原始序列的真实长度（可能超过 max_len）
-            L = min(L_full, max_len)                # 截断后的有效长度
-            drop = L_full - L                       # 从左侧被裁切丢弃的 token 数量
-            b = max(0, boundary - drop)             # 左裁切后重新计算的 prompt/response 边界索引
-            # 关键：ids[-L:] 取"最后 L 个 token"实现左截断——丢弃开头的 (L_full - L) 个 token
-            seq[i, :L] = ids[-L:]                   # 填入截断后的序列
+            # enumerate 同时给出 batch 行号 i 和该行样本内容；i 用来写入 seq/mask/rewards 的第 i 行。
+            # ids 的形状是 (L_full,)，包含 prompt + response 的全部 token。
+            L_full = ids.numel()                    # 原始序列长度（可能超过批次统一长度 max_len）
+            # max_len 是本批次的统一列数：过长样本必须左截断，较短样本稍后右 padding。
+            L = min(L_full, max_len)                # 这条样本在画布中实际保留的有效 token 数
+            # 如果 L_full > max_len，drop 就是从序列左侧丢弃的 token 数；否则 drop=0。
+            # 这个数量用于把原始 boundary 映射到左截断后的新坐标系。
+            drop = L_full - L                       # 左侧被裁切丢弃的 token 数量
+            # boundary 原本表示 prompt 结束位置；左侧丢掉 drop 个 token 后，边界也要左移 drop。
+            # max(0, ...) 防止截断已经穿过整个 prompt：此时保留下来的 token 都视为 response。
+            b = max(0, boundary - drop)             # 截断后 prompt/response 分界线（token 索引）
+            # 负切片 ids[-L:] 的含义是"取最后 L 个 token"，而不是取前 L 个 token。
+            # 左截断专门保留序列尾部，确保最后生成的 response token（尤其是 terminal token）不被丢掉。
+            seq[i, :L] = ids[-L:]                   # 将保留的 token 写入第 i 行的前 L 列
             if L < max_len:
-                # 语法：右 Padding——将短于 max_len 的尾部位置填充为 <pad> token，使该位置在
-                #   注意力计算中被忽略（通常配合 attention_mask 使用，此处用 ID=2 占位）
-                seq[i, L:] = 2  # <pad> token ID = 2
-            # 关键：mask[i, b:L] 只标记 Response 部分的 token 为 True
-            #   b 是 prompt/response 分界线，L 是序列有效长度
-            #   这样在后续计算 loss 时只会对模型"自己的动作"（生成的 token）求梯度
+                # seq[i, L:] 是第 i 行从有效长度 L 到 max_len-1 的尾部切片，形状为 (max_len-L,)。
+                # 这些位置没有真实 token，只是为了和 batch 中最长样本对齐，所以用 pad ID=2 占位。
+                # 右 padding 不改变前 L 个真实 token 的位置；后续 act_mask/last_idx 会排除它们。
+                seq[i, L:] = 2  # 将短样本的尾部补齐到 max_len
+            # mask[i, b:L] 选择第 i 行、列 b（包含）到 L（不包含）的区间，形状为 (L-b,)。
+            # b:L 正好是截断后仍保留的 response token 区间；prompt 和 padding 保持 False。
+            # 后面 act_mask = mask[:, 1:] 会再右移一格，因为 action t 预测 token t+1。
             mask[i, b:L] = True
-            # 稀疏奖励：标量奖励 r_scalar 放在回答序列的最后一个有效 token 位置上
+            # 稀疏 RM 奖励属于整段 response，但要落在最后一个有效 token 的位置 L-1。
+            # 这样 rewards[:, 1:] 对齐到 transition 轴后，最终 action t=L-2 能拿到这个奖励。
             rewards[i, L-1] = r_scalar
+            # last_idx 保存的是"最后 token 的索引"而不是长度；它会在 GAE 中识别每条样本的 terminal 边界。
             last_idx[i] = L-1
 
         # ==========================================
@@ -365,20 +379,37 @@ def main():
         #   _ 是 Python 惯例——占位符，表示"我知道这里有第三个返回值（KVCache），但我不需要它"。
         with torch.no_grad():
             logits, values, _ = policy(seq, None)
-        # values 原始形状 (B, T)，[:, :-1] 丢弃最后一个位置，使 values 形状 (B, T-1) 与 pol_lp 对齐
-        # 为什么丢弃？因为 position T 的 value 预测超出序列范围，没有对应的 token 需要评估。
+        # policy(seq) 会为输入中的每个 token 位置输出一个 value：
+        #   values[:, j] 表示看到 token_j 之后，状态 s_j 的价值 V(s_j)，所以原始形状是 (B, T)。
+        # 但语言模型的 action 是"用位置 j 预测下一个 token_{j+1}"，一共只有 T-1 个 transition：
+        #   logits[:, 0] → 预测 token_1，logprobs[:, 0] → action 0 的概率
+        #   logits[:, 1] → 预测 token_2，logprobs[:, 1] → action 1 的概率
+        #   ...
+        #   logits[:, T-2] → 预测 token_{T-1}，logprobs[:, T-2] → action T-2 的概率
+        # 最后一列 values[:, T-1] 代表"读完最后一个输入 token 后的状态"，但没有 token_T 可供它预测，
+        # 因此没有对应的 action logprob；为了让 values 与 pol_lp 在同一条 transition 轴上对齐，
+        # 只保留 values[:, 0:T-1]，即 (B, T) → (B, T-1)。
+        # 注意：丢弃这一列不等于说这个状态的数学 value 必然为 0；这里只是暂不把它放入 action 对齐张量。
         values = values[:, :-1]
 
         # 仅筛选动作 (Action Tokens, 即 Response 部分) 的对数概率与价值估计
         # 关键理解：PPO 只优化"策略做出的动作"——也就是模型自己生成的 response token。
         #   Prompt 部分的 token 是环境给定的，不是策略的选择，不该参与 actor 的损失计算。
         #
-        # 语法：act_mask = mask[:, 1:] —— 为什么从第 1 列开始切片？
-        #   mask 的形状是 (B, T)，标记了每个"实际 token"是否是 response 部分。
-        #   但 logprobs 的形状是 (B, T-1)，其第 t 个元素对应"位置 t 预测位置 t+1"。
-        #   为了对齐，mask 的第 1~T-1 列（即 mask[:, 1:]）正好对应"预测位置 1~(T-1) 的 token"。
-        #   也就是说，mask[0] 对应 token_0 但 logprobs 第 0 个预测的是 token_1，所以要用 mask[1:]。
-        #   更直观的理解：token_0（通常是 <s>）从来不被任何位置预测，所以 mask 的第 0 列需要排除。
+        # ─── 用一个具体序列理解为什么要 mask[:, 1:] ───
+        # 假设 token 位置和内容是：
+        #   位置:    0    1    2    3    4
+        #   内容:   <s>   P   R1   R2  EOS
+        #   mask:    F    F    T    T    T
+        # 这里 mask 的每一列对应"token 自己是不是 response"，所以 R1/R2/EOS 的位置为 True。
+        # 但语言模型的第 t 列 logits 并不是在评估 token_t，而是在预测下一个 token_{t+1}：
+        #   logits[0] → 预测 token_1，logprobs[0] → token_1 的概率
+        #   logits[1] → 预测 token_2，logprobs[1] → token_2 的概率
+        #   logits[2] → 预测 token_3，logprobs[2] → token_3 的概率
+        #   logits[3] → 预测 token_4，logprobs[3] → token_4 的概率
+        # 因此 logprobs 的第 t 列必须搭配 mask 的第 t+1 列；mask[:, 1:] 就是把这张 token mask
+        # 向左对齐到"预测时间步"。上例中 act_mask 变成 [F, T, T, T]，正好选中 R1/R2/EOS。
+        # mask[:, 0] 被丢掉不是丢掉第一个 response，而是因为 token_0（通常是 <s>）从未被预测。
         act_mask = mask[:,1:]  # 形状: (B, T-1)，True 的位置 = "被预测的是否是response token"
         # 布尔索引筛选：act_mask 为 True 的位置被拉平为一维向量
         # .detach() 切断梯度——旧策略的概率在 PPO 更新中作为常数基准，不应回传梯度
@@ -444,8 +475,8 @@ def main():
         #   padding 和 prompt 位置都会重置递推状态。
         with torch.no_grad():
             T1 = values.size(1)              # 预测时刻轴长度 = T-1
-            adv_full = torch.zeros_like(values)      # (B, T-1) 每个预测时刻的优势
-            returns_full = torch.zeros_like(values)  # (B, T-1) 价值头的回归目标
+            adv_full = torch.zeros_like(values)      # (B, T-1) 每个预测时刻的优势，actor loss
+            returns_full = torch.zeros_like(values)  # (B, T-1) 价值头的回归目标critic loss
             # values[:, t] 是 action t 的当前状态价值，action t 预测 token t+1。
             # 因此 last_idx（最后一个 token 的位置）对应的最后一个 action 是 last_idx - 1。
             time = torch.arange(T1, device=device).unsqueeze(0)  # (1, T-1)
@@ -463,7 +494,7 @@ def main():
                 next_v = torch.where(
                     nonterminal[:, t], next_values[:, t], torch.zeros_like(next_values[:, t])
                 )
-                # ① 惊喜度：δ_t = 实际拿到的（奖励 + 未来预估）− 我原本预测的价值
+                # ① TD error：δ_t = 实际拿到的（奖励 + 未来预估）− 我原本预测的价值
                 delta = r_t[:, t] + args.gamma * next_v - values[:, t]
                 # ② 关键递推：A_t = δ_t + γλ·A_{t+1}
                 #    未来每步的惊喜按 γλ 衰减累积——λ 越大"看得越远"
@@ -473,7 +504,6 @@ def main():
                 A_next = torch.where(act_mask[:, t], candidate, torch.zeros_like(candidate))
                 adv_full[:, t] = A_next
                 # 价值头回归目标：returns_t = A_t + V(s_t)
-                # （价值头要学的不是"惊喜"而是"完整回报"，所以把基线加回去）
                 returns_t = A_next + values[:, t]
                 returns_full[:, t] = torch.where(
                     act_mask[:, t], returns_t, torch.zeros_like(returns_t)
