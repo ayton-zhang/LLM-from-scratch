@@ -126,10 +126,24 @@ def model_logprobs(model, x: torch.Tensor) -> torch.Tensor:
 # ==========================================
 # KL 散度近似计算
 # ==========================================
-def approx_kl(policy_logp: torch.Tensor, ref_logp: torch.Tensor) -> torch.Tensor:
-    # Monte Carlo 近似：KL(π_policy || π_ref) ≈ E[log π_policy - log π_ref]
-    # 使用采样到的动作 token 而非遍历整个词表；.mean() 消除序列长度差异的影响
-    return (policy_logp - ref_logp).mean()
+def approx_kl(policy_logp: torch.Tensor, ref_logp: torch.Tensor,
+              weights: torch.Tensor | None = None) -> torch.Tensor:
+    # GRPO 直接加到 loss 的 KL 使用论文中的 k3 估计器，而不是简单的 log-ratio：
+    #   k3 = exp(log π_ref - log π_policy)
+    #        - (log π_ref - log π_policy) - 1
+    # 令 x = log π_ref - log π_policy，则 exp(x) - x - 1 >= 0，
+    # 因此这个估计值不会像简单的 (policy_logp - ref_logp) 那样出现负数。
+    # 这里仍然只用采样到的动作 token，而不是遍历完整词表，所以它是 Monte Carlo 估计。
+    log_ratio = ref_logp - policy_logp
+    kl = torch.exp(log_ratio) - log_ratio - 1.0
+
+    # weights 用来实现论文中的“每条 response 等权”聚合：
+    #   每个 token 的权重 = 1 / 该 response 的 token 数；
+    #   这样一条回答内部先平均，再对回答平均，长回答不会因为 token 更多而占更大权重。
+    if weights is None:
+        return kl.mean()
+    weight_sum = weights.sum().clamp_min(torch.finfo(kl.dtype).eps)
+    return (kl * weights).sum() / weight_sum
 
 # ---------- small prompt source ----------
 # ==========================================

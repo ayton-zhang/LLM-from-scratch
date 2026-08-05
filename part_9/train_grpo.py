@@ -11,15 +11,15 @@
 #     - 每一步只采样一个回答；KL 惩罚通过改 reward（shaped reward）实现
 #   GRPO（本文件，DeepSeekMath 论文）：
 #     - 【去掉价值头】！对每个 Prompt 采样 G 个回答组成"组"
-#     - Advantage 用"组内相对奖励"：adv_i = r_i - 组均值（同组回答互相对比）
-#     - KL 惩罚直接加到损失函数里（total = L_PPO + kl_coef * KL(π||π_ref)）
+#     - Advantage 用"组内相对奖励"：adv_i = (r_i - 组均值) / 组标准差
+#     - KL 惩罚直接加到损失函数里，并使用论文中的 k3 正值估计器
 #     - 好处：省掉价值网络的训练成本；组内对比天然消除了奖励分布的偏移
 #
 # 整体流程概览（5 个阶段）：
 #   A. 采样生成：每步选 P 个 Prompt，每个生成 G 个回答 → B = P×G 条轨迹
 #   B. 张量对齐：左截断 + 右 Padding 成规整批次，构造动作掩码
-#   C. 对数概率：算 old_logp / ref_logp（逐 token），并逐 token 估计 KL
-#   D. 组内优势：按 prompt 分组，adv = 个体奖励 - 组均值，广播到组内每个 token
+#   C. 对数概率：算 old_logp / ref_logp（逐 token）
+#   D. 组内优势：按 prompt 分组，标准化后广播到组内每个 token
 #   E. PPO 更新：Policy-Only Clipped Loss + KL 惩罚，反向传播更新参数
 # ==========================================
 
@@ -29,7 +29,7 @@ import argparse, torch
 from pathlib import Path
 
 from policy import PolicyWithValue  # we will ignore the value head  ← GRPO 用不到价值头，只取 logits
-from rollout import RLHFTokenizer, format_prompt_only, sample_prompts, model_logprobs
+from rollout import RLHFTokenizer, format_prompt_only, sample_prompts, model_logprobs, approx_kl
 
 # Reward model from Part 7
 # 跨模块动态导入：Part 7 与 Part 9 是兄弟目录，需要手动加入模块搜索路径
@@ -83,6 +83,8 @@ def main():
     #   每步选择的【不同 prompt 数量】P。P 个 prompt 各生成 G 个回答 → 每步 B = P×G 条轨迹
     p.add_argument('--group_size', type=int, default=4, help='completions per prompt')
     #   每个 prompt 的【回答数】G，即"组大小"。G 越大，组内基线越准（但显存线性增长）
+    p.add_argument('--ref_update_interval', type=int, default=1,
+                   help='每隔多少步将 Reference 更新为当前 Policy；1=每步更新，0=始终固定 SFT')
     p.add_argument('--block_size', type=int, default=256)   # 序列最大长度（含 prompt + response）
     p.add_argument('--resp_len', type=int, default=64)      # response 最大 token 数
     p.add_argument('--kl_coef', type=float, default=0.01)   # KL 惩罚系数（防 Reward Hacking / 语言退化）
@@ -90,6 +92,11 @@ def main():
     p.add_argument('--bpe_dir', type=str, default=None)     # BPE 词表目录
     p.add_argument('--cpu', action='store_true')            # 强制 CPU
     args = p.parse_args()
+
+    # GRPO 依靠同一个 Prompt 的多个回答做相对比较；G=1 时组内奖励恒等于组均值，
+    # Advantage 全为 0，Policy 就没有来自奖励的有效学习信号。
+    if args.group_size < 2:
+        raise ValueError('--group_size 必须至少为 2，GRPO 才能形成组内相对奖励')
 
     # 语法：`A if 条件 else B` 三元表达式——有 GPU 且未强制 CPU 则用 cuda，否则用 cpu
     device = torch.device('cuda' if torch.cuda.is_available() and not args.cpu else 'cpu')
@@ -116,7 +123,10 @@ def main():
     policy.lm.load_state_dict(ckpt['model'])  # 用 SFT 权重初始化 LM 部分
     policy.eval()  # 先切 eval 模式：生成阶段禁用 Dropout
 
-    # Reference：冻结的基准模型（参数永不更新）
+    # Reference：冻结的基准模型。
+    # 初始时它与 SFT Policy 相同；如果 ref_update_interval > 0，
+    # 训练循环会在指定间隔把当前 Policy 的 LM 权重复制到这里，
+    # 这对应论文 iterative GRPO 的“每轮更新 Reference”步骤。
     ref = PolicyWithValue(vocab_size, block_size, n_layer, n_head, n_embd).to(device)
     ref.lm.load_state_dict(ckpt['model'])
     # 逐个参数关闭梯度：Ref 不参与反向传播，省显存且保证是不可变的标尺
@@ -140,9 +150,11 @@ def main():
     # ==========================================
     # 4. 初始化优化器
     # ==========================================
-    # 只优化 policy.parameters()——Ref 和 RM 都不参与更新。
+    # GRPO 是纯 Policy 优化，不需要训练复用模型中的 Value Head。
+    # 只把 policy.lm.parameters() 交给优化器，避免把永远没有梯度的 val_head
+    # 也放进参数列表；Ref 和 RM 都不参与更新。
     # betas=(0.9, 0.999) 是 Adam 标准动量参数。
-    opt = torch.optim.AdamW(policy.parameters(), lr=args.lr, betas=(0.9, 0.999))
+    opt = torch.optim.AdamW(policy.lm.parameters(), lr=args.lr, betas=(0.9, 0.999))
 
     # 微型 Prompt 池：16 条内置 prompt 循环使用（教学简化版，真实 RLHF 用数万条）
     prompts_pool = sample_prompts(16)
@@ -152,6 +164,14 @@ def main():
     G = args.group_size
 
     while step < args.steps:
+        # ─── Iterative GRPO：在本轮 rollout 开始前刷新 Reference ───
+        # 当前教学代码每个 step 只做一次 Policy update，因此默认 interval=1 时，
+        # 每个 step 都相当于论文中的一个外层迭代：先固定本轮 Reference，再采样和更新。
+        # 传入 0 则保留传统 RLHF 的固定 SFT Reference，方便对比两种训练方式。
+        if args.ref_update_interval > 0 and step % args.ref_update_interval == 0:
+            with torch.no_grad():
+                ref.lm.load_state_dict(policy.lm.state_dict())
+
         # ==========================================
         # 阶段 A：选择 Prompts 并采样生成回答（含组结构）
         # ==========================================
@@ -176,8 +196,7 @@ def main():
         seq_list = []        # list[Tensor of token ids]——完整序列（prompt + response）
         boundary_list = []   # index where response starts in the (possibly clipped) sequence——prompt/response 分界
         prompt_id_of = []    # which prompt this trajectory belongs to (0..P-1)——轨迹归属的组编号
-        raw_rewards = []     # scalar reward per trajectory (before KL shaping)——RM 原始奖励（无 KL 塑造）
-        last_idx_list = []   # for padding bookkeeping
+        raw_rewards = []     # scalar reward per trajectory——RM 原始结果奖励（KL 单独进入 loss）
 
         with torch.no_grad():
             # 双重循环：外层遍历 P 个 prompt，内层每个 prompt 生成 G 个回答（形成"组"）
@@ -250,11 +269,6 @@ def main():
         old_logp = pol_lp_full[act_mask].detach()  # (N_act,)；detach 使旧策略概率成为常数基准
         ref_logp = ref_lp_full[act_mask].detach()  # (N_act,)
 
-        # per-token KL on action tokens
-        # 逐 token 的 KL 近似：KL(π_old || π_ref) ≈ log π_old - log π_ref
-        # 注意：这个 kl_tok 在当前实现中只用于诊断/参考，实际 KL 惩罚用的是更新后的 kl_now_ref_mean
-        kl_tok = (old_logp - ref_logp)  # (N_act,)
-
         # ==========================================
         # 阶段 D：组内相对优势 (Group Relative Advantage)
         # ==========================================
@@ -263,56 +277,67 @@ def main():
         #   GRPO ：Advantage = 个体奖励 - 【同组均值】（没有价值头！）
         # 直觉：同一个 prompt 的 G 个回答相互比较——"你这组里最好的那个就值得学"。
         #       组均值充当基线，自动抵消奖励模型的系统性偏差（对某些 prompt 偏好打分偏高/偏低）。
-        # ----- SHAPED TRAJECTORY REWARD & GROUP BASELINE -----
-        # For GRPO, advantage is trajectory-level and broadcast to its tokens.
-        # We include KL shaping at trajectory level using mean token KL per trajectory.
-        # First, compute mean KL per trajectory on its action tokens.
-        # Build an index map from flat action tokens back to traj ids.
-        # We can reconstruct counts by iterating rows.
+        # ----- OUTCOME REWARD & GROUP BASELINE -----
+        # 当前实现采用论文中的 outcome supervision：Reward Model 为每条完整回答
+        # 给一个标量分数，而不是为每个 token 单独给 reward。
+        # 因此这里不把 KL 改写进 reward；GRPO 会在后面把 KL 直接加到 loss。
+        # Advantage 先在“回答/轨迹”级别计算，再广播给这条回答的每个 action token。
+        # 同一个回答的 token 共享同一个 A_i，这是 GRPO 与 PPO 的 GAE 逐 token 优势的关键区别。
+        #
+        # 同时建立“扁平 action token → 所属轨迹”的索引，后面需要：
+        #   1. 把轨迹级 Advantage 广播到 token；
+        #   2. 给每个 token 赋 1/response_length 权重，使每条回答最终等权。
         # 第一步：建立"扁平动作 token → 所属轨迹"的索引映射。
         # 因为 act_mask 把 token 展平了，后面广播组优势时要知道每个 token 属于哪条轨迹。
         traj_id_for_token = []
         counts = torch.zeros(B, dtype=torch.long, device=device)
-        offset = 0
         for i in range(B):
             mrow = act_mask[i]                      # 第 i 条轨迹的动作掩码
             n_i = int(mrow.sum().item())            # 该轨迹的动作 token 数
             if n_i > 0:
                 traj_id_for_token.extend([i] * n_i) # 每个动作 token 记下所属轨迹 id i
             counts[i] = n_i
-            offset += n_i
         traj_id_for_token = torch.tensor(traj_id_for_token, dtype=torch.long, device=device)  # (N_act,)
         raw_rewards_t = torch.tensor(raw_rewards, dtype=torch.float, device=device)  # (B,) 每条轨迹的 RM 奖励
 
-        # 第二步：计算每个 prompt 组的奖励均值（组基线）
+        # 第二步：对每个 prompt 组分别计算奖励均值和标准差。
+        # 论文的 outcome Advantage 是：
+        #   A_i = (r_i - mean(r_group)) / std(r_group)
+        # 这里使用 unbiased=False 的总体标准差，避免小组（例如 G=2）或边界输入产生 NaN。
         # 语法：列表推导 [i for i in range(B) if prompt_id_of[i] == pid] 找出属于组 pid 的所有轨迹
         group_mean = torch.zeros(B, dtype=torch.float, device=device)
+        group_std = torch.ones(B, dtype=torch.float, device=device)
         for pid in range(P):
             idxs = [i for i in range(B) if prompt_id_of[i] == pid]
             if not idxs:
                 continue
             idxs_t = torch.tensor(idxs, dtype=torch.long, device=device)
             mean_val = raw_rewards_t[idxs_t].mean()  # 该组 G 个回答的平均奖励
-            group_mean[idxs_t] = mean_val            # 组内所有轨迹共享同一个基线值
+            std_val = raw_rewards_t[idxs_t].std(unbiased=False).clamp_min(1e-6)
+            group_mean[idxs_t] = mean_val            # 组内所有轨迹共享同一个均值 baseline
+            group_std[idxs_t] = std_val              # 组内所有轨迹共享同一个尺度
 
-        # 第三步：轨迹级优势 = 个体奖励 - 组均值（正值 = 该回答比同组平均水平好）
-        # Advantage per trajectory, broadcast to its action tokens
-        traj_adv = raw_rewards_t - group_mean  # (B,)
+        # 第三步：轨迹级标准化 Advantage。
+        # 正值表示该回答优于同组平均水平，负值表示低于同组平均水平。
+        traj_adv = (raw_rewards_t - group_mean) / group_std  # (B,)
 
         # 第四步：把轨迹级优势广播（复制）到该轨迹的每个动作 token 上
         # 用刚才建立的索引映射：traj_adv[traj_id_for_token] 形状 (N_act,)
         # Build a flat tensor of advantages aligned with old_logp/new_logp on action tokens
-        if kl_tok.numel() > 0:
+        if old_logp.numel() > 0:
             adv_flat = traj_adv[traj_id_for_token]
         else:
             adv_flat = torch.zeros(0, dtype=torch.float, device=device)  # 空批次保护
 
-        # 第五步：整批优势 Z-Score 归一化（零均值 + 单位方差）
-        # 为什么：PPO 的 clip 范围（±0.2）是固定值，优势尺度不归一化时 clip 效果不稳定
-        # 语法：.std().clamp_min(1e-6) 防止所有优势相同时除零
-        # Normalize advantages (optional but usually helpful)
-        if adv_flat.numel() > 1:
-            adv_flat = (adv_flat - adv_flat.mean()) / (adv_flat.std().clamp_min(1e-6))
+        # 第五步：为每个 action token 构造 1/response_length 权重。
+        # 如果直接对所有 token .mean()，长回答会因为 token 更多而获得更大权重；
+        # 论文公式是“每条回答内部先平均，再对 G 条回答平均”，所以同一回答的
+        # 每个 token 都用 1/该回答 action 数作为权重，后面的 weighted_mean 会再除以权重总和。
+        if old_logp.numel() > 0:
+            response_lengths = counts[traj_id_for_token].to(dtype=old_logp.dtype).clamp_min(1.0)
+            token_weights = response_lengths.reciprocal()
+        else:
+            token_weights = old_logp.new_zeros((0,))
 
         # ==========================================
         # 阶段 E：GRPO 损失计算与梯度更新（Policy-Only）
@@ -329,18 +354,21 @@ def main():
         new_logp_all = logp_full.gather(-1, labels.unsqueeze(-1)).squeeze(-1)  # (B, T-1)
         new_logp = new_logp_all[act_mask]                             # (N_act,) 动作 token 上的新 logp
 
-        # 更新后策略与 Reference 的平均 KL（用作损失里的惩罚项）
-        # 注意与 kl_tok 的区别：kl_tok 是旧的 (old vs ref)，这里用新的 (new vs ref)
-        # Mean KL over action tokens
-        kl_now_ref_mean = (new_logp - ref_logp).mean() if new_logp.numel() > 0 else torch.tensor(0.0, device=device)
+        # 更新策略与 Reference 的 KL（用作损失里的惩罚项）。
+        # 论文 GRPO 不是把 KL 改进 reward，而是直接把 β·KL 加到 loss；
+        # approx_kl 内部使用论文给出的 k3 正值估计器。
+        # token_weights 让 KL 也遵循“每条 response 等权”的聚合方式。
+        kl_now_ref_mean = approx_kl(new_logp, ref_logp, token_weights) if new_logp.numel() > 0 \
+            else new_logp.new_tensor(0.0)
 
         # 调用 GRPO 损失函数：policy-only clipped loss + kl_coef × KL(π_new || π_ref)
         # 参数说明：
         #   new_logp/old_logp : 新旧策略对数概率（算重要性比率 ratio）
-        #   adv               : 组内相对优势（已归一化）
+        #   adv               : 组内均值/标准差归一化后的相对优势
         #   clip_ratio=0.2    : 单步更新幅度限制 ±20%（PPO 信任域）
         #   ent_coef=0.0      : 熵奖励关闭（GRPO 论文原始做法）
         #   kl_coef           : KL 惩罚强度（防止偏离 Reference 太远）
+        #   token_weights    : 每个 token 的 1/response_length 权重，让每条回答等权
         out_loss = ppo_policy_only_losses(
             new_logp=new_logp,
             old_logp=old_logp,
@@ -349,6 +377,7 @@ def main():
             ent_coef=0.0,  # set >0 if you want entropy bonus from -new_logp mean
             kl_coef=args.kl_coef,
             kl_mean=kl_now_ref_mean,
+            token_weights=token_weights,
         )
         loss = out_loss.total_loss
 
@@ -357,7 +386,7 @@ def main():
         opt.zero_grad(set_to_none=True)
         loss.backward()
         # 梯度裁剪：RL 信号噪声大（奖励来自另一个模型），clip 到 1.0 防梯度爆炸（安全阀）
-        torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(policy.lm.parameters(), 1.0)
         opt.step()
         policy.eval()  # 切回 eval 模式，为下一轮采样做准备
 
@@ -366,14 +395,19 @@ def main():
         # ==========================================
         # RLHF 训练不可见——loss 下降不代表模型变好，必须监控 KL 指标：
         #   KL_move：本次更新跑了多远（过大→学习率太大；过小→没学到东西）
-        #   KL_ref ：累计偏离 SFT 初始模型多远（过大→语言可能退化）
+        #   KL_ref ：本轮 Reference 与更新后 Policy 的偏离（过大→本轮更新过猛）
         # Some quick diagnostics (movement vs old, and now vs ref)
         with torch.no_grad():
             lp_post = model_logprobs(policy, seq)[act_mask]  # 更新后用新参数重算 logp
             # 近似 KL(old||new) = E[log π_old - log π_new]：单步更新幅度
-            kl_move = (old_logp - lp_post).mean() if lp_post.numel() > 0 else torch.tensor(0.0, device=device)
-            # KL(now || ref)：与冻结基准的总偏离
-            kl_ref_now = (lp_post - ref_logp).mean() if lp_post.numel() > 0 else torch.tensor(0.0, device=device)
+            if lp_post.numel() > 0:
+                weight_sum = token_weights.sum().clamp_min(torch.finfo(lp_post.dtype).eps)
+                kl_move = ((old_logp - lp_post) * token_weights).sum() / weight_sum
+            else:
+                kl_move = lp_post.new_tensor(0.0)
+            # KL(now || ref)：使用同一个 k3 估计器，且按 response 等权聚合。
+            kl_ref_now = approx_kl(lp_post, ref_logp, token_weights) if lp_post.numel() > 0 \
+                else lp_post.new_tensor(0.0)
 
         step += 1
         if step % 10 == 0:
