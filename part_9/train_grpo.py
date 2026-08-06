@@ -83,7 +83,7 @@ def main():
     #   每步选择的【不同 prompt 数量】P。P 个 prompt 各生成 G 个回答 → 每步 B = P×G 条轨迹
     p.add_argument('--group_size', type=int, default=4, help='completions per prompt')
     #   每个 prompt 的【回答数】G，即"组大小"。G 越大，组内基线越准（但显存线性增长）
-    p.add_argument('--ref_update_interval', type=int, default=1,
+    p.add_argument('--ref_update_interval', type=int, default=0,
                    help='每隔多少步将 Reference 更新为当前 Policy；1=每步更新，0=始终固定 SFT')
     p.add_argument('--block_size', type=int, default=256)   # 序列最大长度（含 prompt + response）
     p.add_argument('--resp_len', type=int, default=64)      # response 最大 token 数

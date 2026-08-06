@@ -1,9 +1,9 @@
 # ==========================================
-# Part 9 编排脚本：一键跑单元测试 + 可选微型 GRPO 演示
+# Part 9 编排脚本：一键跑单元测试 + 微型 GRPO 演示
 # ==========================================
 # 职责：作为 Part 9 的"总控台"，按顺序执行两件事：
 #   1. 运行 grpo_loss 的单元测试（校验损失计算正确性）
-#   2. 可选（--demo）：跑一遍完整的 GRPO 训练 + 评估流水线
+#   2. 默认跑一遍完整的 GRPO 训练 + 评估流水线（可用 --no-demo 跳过）
 #
 # 设计动机：把"测试 + 训练 + 评估"封装成一个命令，避免手动敲一长串
 # 相对路径参数出错。也是每章代码的"验收入口"。
@@ -36,15 +36,16 @@ def run(cmd: str):
 # ==========================================
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    # --demo：可选开关，开启后额外执行完整的 GRPO 训练 + 评估流水线
-    p.add_argument("--demo", action="store_true", help="tiny GRPO demo")
+    # 默认开启 demo；如果只想运行单元测试，显式传入 --no-demo
+    p.add_argument("--demo", action="store_true", default=True, help="tiny GRPO demo")
+    p.add_argument("--no-demo", action="store_false", dest="demo", help="skip the GRPO demo, run tests only")
     args = p.parse_args()
 
     # 1) 单元测试：校验 grpo_loss 的各项损失计算是否符合预期
     #    语法：python -m pytest -q 以 pytest 方式运行测试文件，-q 静默模式只输出概要
     run("python -m pytest -q tests/test_grpo_loss.py")
 
-    # 2) 可选演示（需要 Part 6 的 SFT checkpoint 与 Part 7 的 RM checkpoint）
+    # 2) 演示（默认开启；需要 Part 6 的 SFT checkpoint 与 Part 7 的 RM checkpoint）
     #    --group_size 4  ：每个 prompt 采样 4 个回答组成一个"组"（GRPO 的核心结构）
     #    --batch_prompts 4：每步选 4 个不同的 prompt → 每步共 4×4=16 条轨迹
     #    --resp_len 128   ：回答最长 128 个 token（比默认 64 长，生成更完整）
