@@ -293,9 +293,9 @@ def main():
         counts = torch.zeros(B, dtype=torch.long, device=device)
         for i in range(B):
             mrow = act_mask[i]                      # 第 i 条轨迹的动作掩码
-            n_i = int(mrow.sum().item())            # 该轨迹的动作 token 数
+            n_i = int(mrow.sum().item())            # 该轨迹的response token数量
             if n_i > 0:
-                traj_id_for_token.extend([i] * n_i) # 每个动作 token 记下所属轨迹 id i
+                traj_id_for_token.extend([i] * n_i) # 每个动作 token 记下所属response的ids
             counts[i] = n_i
         traj_id_for_token = torch.tensor(traj_id_for_token, dtype=torch.long, device=device)  # (N_act,)
         raw_rewards_t = torch.tensor(raw_rewards, dtype=torch.float, device=device)  # (B,) 每条轨迹的 RM 奖励
@@ -334,8 +334,8 @@ def main():
         # 论文公式是“每条回答内部先平均，再对 G 条回答平均”，所以同一回答的
         # 每个 token 都用 1/该回答 action 数作为权重，后面的 weighted_mean 会再除以权重总和。
         if old_logp.numel() > 0:
-            response_lengths = counts[traj_id_for_token].to(dtype=old_logp.dtype).clamp_min(1.0)
-            token_weights = response_lengths.reciprocal()
+            response_lengths = counts[traj_id_for_token].to(dtype=old_logp.dtype).clamp_min(1.0) # 逐元素的分配response的长度
+            token_weights = response_lengths.reciprocal()# 取倒数获取每个token占response轨迹的权重
         else:
             token_weights = old_logp.new_zeros((0,))
 
